@@ -217,7 +217,7 @@ test_loader  = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test
 # 訓練與評估 (取代原本的 training and evaluation)
 ################################################################
 # 這裡切換為 unet，準備跑你的 U-FNO 創新組
-model = FNO2d(modes, modes, width, local_type='1x1').cuda()
+model = FNO2d(modes, modes, width, local_type='unet').cuda()
 print(f"模型總參數數量: {count_params(model)}")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
