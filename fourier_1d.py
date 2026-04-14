@@ -58,8 +58,28 @@ class SpectralConv1d(nn.Module):
         x = torch.fft.irfft(out_ft, n=x.size(-1))
         return x
 
+class LocalUNetBlock(nn.Module):
+    def __init__(self, width):
+        super(LocalUNetBlock, self).__init__()
+        # 下採樣：把解析度減半，抓取較大範圍的局部特徵
+        self.down = nn.Conv1d(width, width, kernel_size=3, stride=2, padding=1)
+        # 卷積處理
+        self.conv = nn.Conv1d(width, width, kernel_size=3, padding=1)
+        # 最終的線性映射
+        self.final = nn.Conv1d(width, width, 1)
+
+    def forward(self, x):
+        res = x
+        x_down = F.gelu(self.down(x))
+        x_conv = F.gelu(self.conv(x_down))
+        # 上採樣：強制對齊原本輸入的維度長度
+        x_up = F.interpolate(x_conv, size=res.shape[-1], mode='linear', align_corners=True)
+        # 加上殘差連結 (Residual Connection)
+        return self.final(x_up) + res
+
 class FNO1d(nn.Module):
-    def __init__(self, modes, width):
+    # 新增 local_type 參數，預設為標準的 1x1
+    def __init__(self, modes, width, local_type='1x1'):
         super(FNO1d, self).__init__()
 
         """
@@ -79,18 +99,32 @@ class FNO1d(nn.Module):
         self.width = width
         self.padding = 2 # pad the domain if input is non-periodic
         self.fc0 = nn.Linear(2, self.width) # input channel is 2: (a(x), x)
+        self.local_type = local_type # 儲存實驗開關
 
         self.conv0 = SpectralConv1d(self.width, self.width, self.modes1)
         self.conv1 = SpectralConv1d(self.width, self.width, self.modes1)
         self.conv2 = SpectralConv1d(self.width, self.width, self.modes1)
         self.conv3 = SpectralConv1d(self.width, self.width, self.modes1)
-        self.w0 = nn.Conv1d(self.width, self.width, 1)
-        self.w1 = nn.Conv1d(self.width, self.width, 1)
-        self.w2 = nn.Conv1d(self.width, self.width, 1)
-        self.w3 = nn.Conv1d(self.width, self.width, 1)
+        
+        # 使用自訂函數，一次把 4 層的 Local Path 裝好
+        self.w0 = self._get_local_path()
+        self.w1 = self._get_local_path()
+        self.w2 = self._get_local_path()
+        self.w3 = self._get_local_path()
 
         self.fc1 = nn.Linear(self.width, 128)
         self.fc2 = nn.Linear(128, 1)
+
+        # 動態決定 Local Path 積木的函數
+    def _get_local_path(self):
+        if self.local_type == '1x1':
+            return nn.Conv1d(self.width, self.width, 1)
+        elif self.local_type == 'unet':
+            return LocalUNetBlock(self.width)
+        elif self.local_type == 'none':
+            return None
+        else:
+            raise ValueError("local_type must be '1x1', 'unet', or 'none'")
 
     def forward(self, x):
         grid = self.get_grid(x.shape, x.device)
@@ -99,26 +133,26 @@ class FNO1d(nn.Module):
         x = x.permute(0, 2, 1)
         # x = F.pad(x, [0,self.padding]) # pad the domain if input is non-periodic
 
+        # Layer 0
         x1 = self.conv0(x)
-        x2 = self.w0(x)
-        x = x1 + x2
-        x = F.gelu(x)
+        x2 = self.w0(x) if self.w0 is not None else 0  # 安全判斷
+        x = F.gelu(x1 + x2)
 
+        # Layer 1
         x1 = self.conv1(x)
-        x2 = self.w1(x)
-        x = x1 + x2
-        x = F.gelu(x)
+        x2 = self.w1(x) if self.w1 is not None else 0
+        x = F.gelu(x1 + x2)
 
+        # Layer 2
         x1 = self.conv2(x)
-        x2 = self.w2(x)
-        x = x1 + x2
-        x = F.gelu(x)
+        x2 = self.w2(x) if self.w2 is not None else 0
+        x = F.gelu(x1 + x2)
 
+        # Layer 3 (最後一層通常不加 Gelu)
         x1 = self.conv3(x)
-        x2 = self.w3(x)
+        x2 = self.w3(x) if self.w3 is not None else 0
         x = x1 + x2
 
-        # x = x[..., :-self.padding] # pad the domain if input is non-periodic
         x = x.permute(0, 2, 1)
         x = self.fc1(x)
         x = F.gelu(x)
@@ -173,7 +207,7 @@ train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_trai
 test_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test, y_test), batch_size=batch_size, shuffle=False)
 
 # model
-model = FNO1d(modes, width).cuda()
+model = FNO1d(modes, width, local_type='unet').cuda()
 print(count_params(model))
 
 ################################################################
