@@ -174,14 +174,14 @@ class FNO2d(nn.Module):
 ################################################################
 # 讀取 ERA5 氣象資料與設定 (取代原本的 configurations 與 read data)
 ################################################################
-modes = 8    # 注意！因為經度只有 17 個網格，最大傅立葉模態不能超過 17//2 = 8
+modes = 16    # 從 8 提升到 16 (因為空間變大了，最高其實可以設到 161//2=80，但 16 是一個兼具速度與精度的甜蜜點)
 width = 32
 batch_size = 4
 epochs = 50
 
 print("正在讀取 ERA5 氣象資料...")
 # 請確保你的檔案名稱與路徑正確，如果不同請修改這裡
-ds = xr.open_dataset('data/taiwan_era5_202301.nc', engine='h5netcdf')
+ds = xr.open_dataset('data/east_asia_era5_202301.nc', engine='h5netcdf')
 
 # 提取資料並轉換成 PyTorch Tensor
 t2m = torch.tensor(ds['t2m'].values)
