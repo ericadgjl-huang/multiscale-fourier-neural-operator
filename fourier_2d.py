@@ -84,6 +84,70 @@ class SpectralConv2d(nn.Module):
         x = torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
         return x
 
+class AdvancedUNetBlock2d(nn.Module):
+    def __init__(self, width):
+        super(AdvancedUNetBlock2d, self).__init__()
+        # --- Encoder (編碼器：提取深層特徵，通道數倍增) ---
+        self.down1 = nn.Conv2d(width, width*2, kernel_size=3, stride=2, padding=1)
+        self.conv1 = nn.Conv2d(width*2, width*2, kernel_size=3, padding=1)
+
+        self.down2 = nn.Conv2d(width*2, width*2, kernel_size=3, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(width*2, width*2, kernel_size=3, padding=1)
+
+        # --- Decoder (解碼器：結合淺層輪廓與深層語意) ---
+        # 接收 width*2 (來自上採樣) + width*2 (來自 Encoder) = width*4
+        self.up1 = nn.Conv2d(width*4, width*2, kernel_size=3, padding=1) 
+        # 接收 width*2 (來自上採樣) + width (來自最原來的輸入) = width*3
+        self.up2 = nn.Conv2d(width*3, width, kernel_size=3, padding=1)   
+
+        self.final = nn.Conv2d(width, width, 1)
+
+    def forward(self, x):
+        res = x  # 最外層的殘差
+
+        # --- 下採樣路徑 ---
+        e1 = x 
+        d1 = F.gelu(self.down1(e1))
+        c1 = F.gelu(self.conv1(d1)) # 縮小 1/2
+
+        d2 = F.gelu(self.down2(c1))
+        c2 = F.gelu(self.conv2(d2)) # 縮小 1/4
+
+        # --- 上採樣與特徵拼接 (Skip Connection) ---
+        # 放大回 1/2，並與 c1 拼接
+        u1 = F.interpolate(c2, size=(c1.shape[2], c1.shape[3]), mode='bilinear', align_corners=True)
+        concat1 = torch.cat([u1, c1], dim=1)
+        u1_conv = F.gelu(self.up1(concat1))
+
+        # 放大回原尺寸，並與 e1 拼接
+        u2 = F.interpolate(u1_conv, size=(e1.shape[2], e1.shape[3]), mode='bilinear', align_corners=True)
+        concat2 = torch.cat([u2, e1], dim=1)
+        u2_conv = F.gelu(self.up2(concat2))
+
+        return self.final(u2_conv) + res
+
+class ConvNeXtBlock2d(nn.Module):
+    def __init__(self, width):
+        super(ConvNeXtBlock2d, self).__init__()
+        # 1. Depthwise Convolution (超大 7x7 卷積核，不縮小圖片，捕捉廣域氣象特徵)
+        self.dwconv = nn.Conv2d(width, width, kernel_size=7, padding=3, groups=width)
+        
+        # 2. Layer Normalization (氣象資料各變數差異大，Norm 能幫助穩定)
+        self.norm = nn.GroupNorm(1, width) 
+        
+        # 3. Pointwise Convolution (特徵維度放大 4 倍再壓縮，這是 Transformer 的精髓)
+        self.pwconv1 = nn.Conv2d(width, 4 * width, 1) 
+        self.pwconv2 = nn.Conv2d(4 * width, width, 1) 
+
+    def forward(self, x):
+        res = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = F.gelu(x)
+        x = self.pwconv2(x)
+        return x + res
+
 class FNO2d(nn.Module):
     def __init__(self, modes1, modes2,  width, local_type='1x1'):
         super(FNO2d, self).__init__()
@@ -125,10 +189,13 @@ class FNO2d(nn.Module):
             return nn.Conv2d(self.width, self.width, 1)
         elif self.local_type == 'unet':
             return LocalUNetBlock2d(self.width)
+        # --- 新增下面這兩行 ---
+        elif self.local_type == 'advanced_unet':
+            return AdvancedUNetBlock2d(self.width)
+        elif self.local_type == 'convnext':
+            return ConvNeXtBlock2d(self.width)
         elif self.local_type == 'none':
             return None
-        else:
-            raise ValueError("local_type must be '1x1', 'unet', or 'none'")
 
     def forward(self, x):
         grid = self.get_grid(x.shape, x.device)
@@ -217,15 +284,21 @@ test_loader  = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test
 # 訓練與評估 (取代原本的 training and evaluation)
 ################################################################
 # 這裡切換為 unet，準備跑你的 U-FNO 創新組
-model = FNO2d(modes, modes, width, local_type='unet').cuda()
+model = FNO2d(modes, modes, width, local_type='advanced_unet').cuda()
 print(f"模型總參數數量: {count_params(model)}")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
 
-# 根據 local_type 自動判斷顯示名稱
-model_name = "U-FNO (創新組)" if model.local_type == 'unet' else "FNO Baseline (對照組)"
-if model.local_type == 'none': model_name = "Pure FNO (消融組)"
+# 自動判斷實驗名稱
+if model.local_type == 'unet':
+    model_name = "U-FNO (極簡版)"
+elif model.local_type == 'advanced_unet':
+    model_name = "Advanced U-FNO (深層拼接版)"
+elif model.local_type == 'convnext':
+    model_name = "ConvNeXt-FNO (大卷積核版)"
+else:
+    model_name = "FNO Baseline (1x1對照組)"
 
 print(f"========================================")
 print(f" 正在啟動訓練：{model_name}")
