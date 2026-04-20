@@ -2,7 +2,7 @@
 @author: Zongyi Li
 This file is the Fourier Neural Operator for 2D problem such as the Darcy Flow discussed in Section 5.2 in the [paper](https://arxiv.org/pdf/2010.08895.pdf).
 """
-
+import torch_harmonics as th
 import numpy as np
 import torch
 import torch.nn as nn
@@ -42,6 +42,42 @@ class LocalUNetBlock2d(nn.Module):
         # 2D 上採樣，確保尺寸與輸入一致
         x_up = F.interpolate(x_conv, size=(res.shape[2], res.shape[3]), mode='bilinear', align_corners=True)
         return self.final(x_up) + res
+################################################################
+# SphericalConv2d
+################################################################
+class SphericalConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes, nlat=33, nlon=64):
+        super(SphericalConv2d, self).__init__()
+        """
+        Spherical Harmonic Transform (SHT) Layer
+        專為地球球面設計，取代傳統的 2D FFT。
+        """
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes = modes # 球面調和函數的最高階數 (lmax, mmax)
+        
+        # 1. 宣告正向與反向的球面調和轉換 (SHT / ISHT)
+        # ERA5 是標準的經緯度網格，所以我們使用 "equiangular"
+        self.sht = th.RealSHT(nlat, nlon, lmax=modes, mmax=modes, grid="equiangular")
+        self.isht = th.InverseRealSHT(nlat, nlon, lmax=modes, mmax=modes, grid="equiangular")
+        
+        # 2. 頻域上的可學習權重 (Complex Weights)
+        self.scale = (1 / (in_channels * out_channels))
+        self.weights = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, modes, modes, dtype=torch.cfloat))
+
+    def forward(self, x):
+        # 正向 SHT：將空間氣象場轉為「球面頻譜」
+        # x shape: (batch, in_channels, nlat, nlon)
+        x_sht = self.sht(x) 
+        
+        # 在頻譜空間中進行矩陣相乘 (過濾與特徵提取)
+        # out shape: (batch, out_channels, lmax, mmax)
+        out_sht = torch.einsum("b i l m, i o l m -> b o l m", x_sht, self.weights)
+        
+        # 反向 ISHT：將處理好的頻譜轉回「空間氣象場」
+        x = self.isht(out_sht)
+        return x
+    
 
 ################################################################
 # fourier layer
@@ -168,14 +204,15 @@ class FNO2d(nn.Module):
         self.modes1 = modes1
         self.modes2 = modes2
         self.width = width
-        self.padding = 9 # pad the domain if input is non-periodic
+        # self.padding = 9 # pad the domain if input is non-periodic
         self.fc0 = nn.Linear(6, self.width) # input channel is 6: (a(x, y), x, y, x^2, y^2, xy)
         self.local_type = local_type # 儲存實驗開關
 
-        self.conv0 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
-        self.conv1 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
-        self.conv2 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
-        self.conv3 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+        # 換上全新的球面調和引擎！注意參數只傳入 modes1 即可
+        self.conv0 = SphericalConv2d(self.width, self.width, self.modes1)
+        self.conv1 = SphericalConv2d(self.width, self.width, self.modes1)
+        self.conv2 = SphericalConv2d(self.width, self.width, self.modes1)
+        self.conv3 = SphericalConv2d(self.width, self.width, self.modes1)
         self.w0 = self._get_local_path()
         self.w1 = self._get_local_path()
         self.w2 = self._get_local_path()
@@ -202,7 +239,7 @@ class FNO2d(nn.Module):
         x = torch.cat((x, grid), dim=-1)
         x = self.fc0(x)
         x = x.permute(0, 3, 1, 2)
-        x = F.pad(x, [0,self.padding, 0,self.padding])
+        # x = F.pad(x, [0,self.padding, 0,self.padding])
 
         x1 = self.conv0(x)
         x2 = self.w0(x)
@@ -223,7 +260,7 @@ class FNO2d(nn.Module):
         x2 = self.w3(x)
         x = x1 + x2
 
-        x = x[..., :-self.padding, :-self.padding]
+        # x = x[..., :-self.padding, :-self.padding]
         x = x.permute(0, 2, 3, 1)
         x = self.fc1(x)
         x = F.gelu(x)
@@ -244,11 +281,11 @@ class FNO2d(nn.Module):
 modes = 16    # 從 8 提升到 16 (因為空間變大了，最高其實可以設到 161//2=80，但 16 是一個兼具速度與精度的甜蜜點)
 width = 32
 batch_size = 4
-epochs = 50
+epochs = 20
 
 print("正在讀取 ERA5 氣象資料...")
 # 請確保你的檔案名稱與路徑正確，如果不同請修改這裡
-ds = xr.open_dataset('data/east_asia_era5_202301.nc', engine='h5netcdf')
+ds = xr.open_dataset('data/global_era5_mini_202301.nc', engine='h5netcdf') # 改成這顆迷你地球
 
 # 提取資料並轉換成 PyTorch Tensor
 t2m = torch.tensor(ds['t2m'].values)
@@ -375,3 +412,38 @@ for i in range(4):
 plt.tight_layout()
 plt.savefig('weather_prediction.png')
 print("繪圖完成！請查看專案資料夾下的 weather_prediction.png")
+
+print("正在繪製 3D 球體預測圖...")
+
+# 取出模型預測的溫度資料 (第 0 個通道)
+# 確保資料形狀是 (33, 64)
+temp_pred = prediction[:, :, 0]
+
+# 1. 建立球面網格 (經度 0~2pi, 緯度 0~pi)
+lon = np.linspace(0, 2 * np.pi, 64)
+lat = np.linspace(0, np.pi, 33)
+lon, lat = np.meshgrid(lon, lat)
+
+# 2. 將球面座標 (lat, lon) 轉換為 3D 笛卡兒座標 (X, Y, Z)
+X = np.sin(lat) * np.cos(lon)
+Y = np.sin(lat) * np.sin(lon)
+Z = np.cos(lat)
+
+# 3. 將溫度資料標準化到 0~1，以便對應顏色表 (Colormap)
+temp_norm = (temp_pred - temp_pred.min()) / (temp_pred.max() - temp_pred.min() + 1e-6)
+# 生成顏色矩陣
+colors = plt.cm.jet(temp_norm)
+
+# 4. 繪製 3D 球體
+fig = plt.figure(figsize=(10, 10))
+ax = fig.add_subplot(111, projection='3d')
+
+# 關閉座標軸背景，讓地球懸浮在太空中
+ax.axis('off')
+
+# 繪製曲面 (plot_surface)
+surf = ax.plot_surface(X, Y, Z, facecolors=colors, rstride=1, cstride=1, antialiased=True, shade=False)
+
+ax.set_title("Global Temperature Prediction (SFNO)", fontsize=16, pad=20)
+plt.savefig('weather_prediction_3d.png', dpi=300, bbox_inches='tight')
+print("3D 繪圖完成！請查看 weather_prediction_3d.png")
