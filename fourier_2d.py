@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter
 import xarray as xr   # <--- 補上這行
 
 import matplotlib.pyplot as plt
+import pandas as pd
 
 import operator
 from functools import reduce
@@ -205,7 +206,7 @@ class FNO2d(nn.Module):
         self.modes2 = modes2
         self.width = width
         # self.padding = 9 # pad the domain if input is non-periodic
-        self.fc0 = nn.Linear(6, self.width) # input channel is 6: (a(x, y), x, y, x^2, y^2, xy)
+        self.fc0 = nn.Linear(10, self.width) # input channel is 10: (a(x, y), x, y, x^2, y^2, xy, day_sin, day_cos, hour_sin, hour_cos)
         self.local_type = local_type # 儲存實驗開關
 
         # 換上全新的球面調和引擎！注意參數只傳入 modes1 即可
@@ -293,10 +294,24 @@ msl = torch.tensor(ds['msl'].values)
 u10 = torch.tensor(ds['u10'].values)
 v10 = torch.tensor(ds['v10'].values)
 
-# 將四個變數疊合成一個 tensor，形狀會是 (124, 21, 17, 4)
-data = torch.stack([t2m, msl, u10, v10], dim=-1)
-data = torch.nan_to_num(data, nan=0.0) # 填補可能的空值
+# --- 幫模型裝上「時鐘」 (Time Embedding) ---
+# 1. 抓出 NetCDF 裡面的時間戳記
+times = ds['valid_time'].values
+dt = pd.to_datetime(times)
 
+# 2. 將 365 天與 24 小時轉換成圓周上的弧度
+day_rad = torch.tensor(dt.dayofyear.values, dtype=torch.float32) * (2 * np.pi / 365.25)
+hour_rad = torch.tensor(dt.hour.values, dtype=torch.float32) * (2 * np.pi / 24.0)
+
+# 3. 算出 sin 和 cos，並將形狀擴張 (Broadcast) 到與氣象圖一樣的空間大小 (33, 64)
+day_sin = torch.sin(day_rad).view(-1, 1, 1).expand(-1, 33, 64)
+day_cos = torch.cos(day_rad).view(-1, 1, 1).expand(-1, 33, 64)
+hour_sin = torch.sin(hour_rad).view(-1, 1, 1).expand(-1, 33, 64)
+hour_cos = torch.cos(hour_rad).view(-1, 1, 1).expand(-1, 33, 64)
+
+# 4. 把 4 個氣象變數 + 4 個時間變數，疊合成 8 個通道！
+data = torch.stack([t2m, msl, u10, v10, day_sin, day_cos, hour_sin, hour_cos], dim=-1)
+data = torch.nan_to_num(data, nan=0.0) # 填補可能的空值
 # 建立預測序列：X 是現在 (0~122), Y 是未來 (1~123)
 # x_data = data[:-1, :, :, :]
 # y_data = data[1:, :, :, :]
@@ -325,12 +340,12 @@ x_test, y_test   = x_data[100:], y_data[100:]
 
 # 資料標準化 Normalization (氣象資料必做，否則數值差異太大無法收斂)
 x_mean, x_std = x_train.mean(dim=(0, 1, 2), keepdim=True), x_train.std(dim=(0, 1, 2), keepdim=True)
-y_mean, y_std = y_train.mean(dim=(0, 1, 2), keepdim=True), y_train.std(dim=(0, 1, 2), keepdim=True)
 
+# 統一使用 x_mean 與 x_std 進行正規化，因為 x 是 4D，y 是 5D，PyTorch 會自動從右邊對齊完美廣播！
 x_train = (x_train - x_mean) / (x_std + 1e-6)
 x_test  = (x_test - x_mean) / (x_std + 1e-6)
-y_train = (y_train - y_mean) / (y_std + 1e-6)
-y_test  = (y_test - y_mean) / (y_std + 1e-6)
+y_train = (y_train - x_mean) / (x_std + 1e-6)
+y_test  = (y_test - x_mean) / (x_std + 1e-6)
 
 train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_train, y_train), batch_size=batch_size, shuffle=True)
 test_loader  = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test, y_test), batch_size=batch_size, shuffle=False)
@@ -370,12 +385,23 @@ for ep in range(epochs):
         optimizer.zero_grad()
         
         # --- 動態自迴歸滾動預測 ---
-        pred_current = x
+        current_input = x
         total_loss = 0
         
         for step in range(rollout_steps):
-            pred_current = model(pred_current) # 把剛剛的預測當成新的輸入
-            total_loss += F.mse_loss(pred_current, y[:, step]) # 加上這一步的誤差
+            # 1. 預測下一步的氣象 (輸出只有 4 個通道)
+            pred_weather = model(current_input) 
+            
+            # 2. 只抽出標準答案的「前 4 個氣象變數」來算 Loss
+            true_weather = y[:, step, :, :, :4]
+            total_loss += F.mse_loss(pred_weather, true_weather) 
+            
+            # 3. 準備下一次滾動的輸入！(結合 預測天氣 + 未來時間)
+            if step < rollout_steps - 1:
+                # 拿出下一步的「真實時間」通道 (索引 4~7)
+                next_time_features = y[:, step, :, :, 4:]
+                # 將「預測的氣象」與「未來的時間」像三明治一樣疊起來，成為完整的 8 通道輸入
+                current_input = torch.cat([pred_weather, next_time_features], dim=-1)
             
         # 總分加總，一起做反向傳播
         total_loss.backward()
@@ -392,10 +418,18 @@ for ep in range(epochs):
         for x, y in test_loader:
             x, y = x.cuda(), y.cuda()
             
-            pred_current = x
+            current_input = x
             for step in range(rollout_steps):
-                pred_current = model(pred_current)
-                test_mse += F.mse_loss(pred_current, y[:, step]).item()
+                # 預測氣象 (4通道)
+                pred_weather = model(current_input)
+                # 拿答案的前 4 個氣象通道算誤差
+                true_weather = y[:, step, :, :, :4]
+                test_mse += F.mse_loss(pred_weather, true_weather).item()
+                
+                # 準備下一步的輸入
+                if step < rollout_steps - 1:
+                    next_time_features = y[:, step, :, :, 4:]
+                    current_input = torch.cat([pred_weather, next_time_features], dim=-1)
 
     train_mse /= len(train_loader)
     test_mse /= len(test_loader)
@@ -415,20 +449,25 @@ with torch.no_grad():
         x, y = x.cuda(), y.cuda()
         
         # --- 動態滾動預測畫圖 ---
-        pred_current = x
+        current_input = x
         for step in range(rollout_steps):
-            pred_current = model(pred_current)
+            pred_weather = model(current_input)
+            
+            if step < rollout_steps - 1:
+                next_time_features = y[:, step, :, :, 4:]
+                current_input = torch.cat([pred_weather, next_time_features], dim=-1)
         
-        final_pred = pred_current # 儲存最後一步的結果
+        final_pred = pred_weather # 儲存最後一步的結果
         break # 畫一筆就好
 
 # 將 Tensor 轉回 CPU 上的 numpy 陣列以便畫圖
 idx = 0
-time_step = rollout_steps - 1 # 0代表第一步(T+1)，1代表第二步(T+2)
+time_step = rollout_steps - 1 # 0代表第一步(T+1)
 
-# 加上 [time_step] 降維，拿出對應的真實答案
-ground_truth = y[idx, time_step].cpu().numpy()
-# 拿出第二步的預測結果
+# 加上 [time_step] 降維，並只拿出前 4 個「氣象通道」的真實答案
+ground_truth = y[idx, time_step, :, :, :4].cpu().numpy()
+
+# 拿出最後一步的預測結果 
 prediction = final_pred[idx].cpu().numpy()
 
 # 氣象變數名稱對應 (通道 0:溫度, 1:氣壓, 2:U風, 3:V風)
@@ -477,6 +516,6 @@ fig = plt.figure(figsize=(10, 10))
 ax = fig.add_subplot(111, projection='3d')
 ax.axis('off')
 surf = ax.plot_surface(X, Y, Z, facecolors=colors, rstride=1, cstride=1, antialiased=True, shade=False)
-ax.set_title(f"Global Temp Prediction Step 2 (SFNO)", fontsize=16, pad=20)
+ax.set_title(f"Global Temp Prediction Step {rollout_steps}", fontsize=16, pad=20)
 plt.savefig('weather_prediction_3d.png', dpi=300, bbox_inches='tight')
 print("3D 繪圖完成！")
