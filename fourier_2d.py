@@ -376,6 +376,10 @@ print(f" 局部路徑類型：{model.local_type}")
 print(f" 模型總參數：{count_params(model)}")
 print(f"========================================")
 
+# --- 新增：準備紀錄學習曲線的陣列 ---
+history_train_mse = []
+history_test_mse = []
+
 for ep in range(epochs):
     model.train()
     t1 = default_timer()
@@ -436,6 +440,25 @@ for ep in range(epochs):
     t2 = default_timer()
     print(f"Epoch: {ep} | 耗時: {t2-t1:.2f}s | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}")
 
+    # --- 新增：把每一圈的分數存起來 ---
+    history_train_mse.append(train_mse)
+    history_test_mse.append(test_mse)
+# ==========================================
+# (原本的訓練迴圈到這裡結束，注意縮排要退回最外層！)
+# ==========================================
+
+# --- 新增：訓練結束後，繪製學習曲線 ---
+plt.figure(figsize=(10, 6))
+plt.plot(history_train_mse, label='Train MSE', linewidth=2)
+plt.plot(history_test_mse, label='Test MSE', linewidth=2)
+plt.xlabel('Epochs', fontsize=14)
+plt.ylabel('MSE Loss', fontsize=14)
+plt.title(f'Learning Curve - {model_name}', fontsize=16)
+plt.legend(fontsize=12)
+plt.grid(True)
+plt.savefig('learning_curve.png', dpi=300, bbox_inches='tight')
+plt.close()
+print("學習曲線繪製完成！請查看 learning_curve.png")
 ################################################################
 # 5. 視覺化預測結果 (畫圖)
 ################################################################
@@ -471,21 +494,33 @@ ground_truth = y[idx, time_step, :, :, :4].cpu().numpy()
 prediction = final_pred[idx].cpu().numpy()
 
 # 氣象變數名稱對應 (通道 0:溫度, 1:氣壓, 2:U風, 3:V風)
+# 氣象變數名稱對應 (通道 0:溫度, 1:氣壓, 2:U風, 3:V風)
 var_names = ['Temperature (t2m)', 'Pressure (msl)', 'U-Wind', 'V-Wind']
 
-fig, axes = plt.subplots(4, 2, figsize=(10, 16))
+# --- 新增：計算誤差 (True - Pred) ---
+error_map = ground_truth - prediction
+
+# 改成 4 行 3 列 (True, Pred, Error)，把圖片加寬到 figsize=(15, 16)
+fig, axes = plt.subplots(4, 3, figsize=(15, 16))
 for i in range(4):
-    # 畫出真實答案 (Ground Truth)
+    # 1. 畫出真實答案 (Ground Truth)
     ax_gt = axes[i, 0]
     im_gt = ax_gt.imshow(ground_truth[:, :, i], cmap='jet')
     ax_gt.set_title(f'True {var_names[i]} (T+{time_step+1})')
     fig.colorbar(im_gt, ax=ax_gt)
 
-    # 畫出模型預測 (Prediction)
+    # 2. 畫出模型預測 (Prediction)
     ax_pred = axes[i, 1]
     im_pred = ax_pred.imshow(prediction[:, :, i], cmap='jet')
     ax_pred.set_title(f'Pred {var_names[i]} (T+{time_step+1})')
     fig.colorbar(im_pred, ax=ax_pred)
+    
+    # 3. 畫出誤差圖 (Error Map)
+    ax_err = axes[i, 2]
+    # 誤差圖我們用 'coolwarm' 顏色表：紅色代表真實大於預測(低估)，藍色代表真實小於預測(高估)，白色代表完美預測！
+    im_err = ax_err.imshow(error_map[:, :, i], cmap='coolwarm')
+    ax_err.set_title(f'Error (True - Pred) {var_names[i]}')
+    fig.colorbar(im_err, ax=ax_err)
 
 plt.tight_layout()
 plt.savefig('weather_prediction.png')
