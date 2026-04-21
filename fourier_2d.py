@@ -281,7 +281,7 @@ class FNO2d(nn.Module):
 modes = 16    # 從 8 提升到 16 (因為空間變大了，最高其實可以設到 161//2=80，但 16 是一個兼具速度與精度的甜蜜點)
 width = 32
 batch_size = 4
-epochs = 20
+epochs = 50
 
 print("正在讀取 ERA5 氣象資料...")
 # 請確保你的檔案名稱與路徑正確，如果不同請修改這裡
@@ -298,8 +298,26 @@ data = torch.stack([t2m, msl, u10, v10], dim=-1)
 data = torch.nan_to_num(data, nan=0.0) # 填補可能的空值
 
 # 建立預測序列：X 是現在 (0~122), Y 是未來 (1~123)
-x_data = data[:-1, :, :, :]
-y_data = data[1:, :, :, :]
+# x_data = data[:-1, :, :, :]
+# y_data = data[1:, :, :, :]
+
+# --- 動態多步滾動設定 ---
+rollout_steps = 4  #我們先挑戰連續預測 4 步 (相當於未來 24 小時)
+x_data = data[:-rollout_steps, :, :, :]
+
+# 用 Python 的 List Comprehension 動態抓出未來每一步的答案
+y_list = []
+for i in range(1, rollout_steps + 1):
+    if i == rollout_steps:
+        y_list.append(data[i:, :, :, :])
+    else:
+        y_list.append(data[i : -rollout_steps + i, :, :, :])
+
+# 將未來的答案堆疊在一起，維度變成 (batch, rollout_steps, lat, lon, channels)
+y_data = torch.stack(y_list, dim=1) 
+
+x_train, y_train = x_data[:100], y_data[:100]
+x_test, y_test   = x_data[100:], y_data[100:]
 
 # 切割訓練集 (前 100 筆) 與測試集 (後 23 筆)
 x_train, y_train = x_data[:100], y_data[:100]
@@ -351,21 +369,33 @@ for ep in range(epochs):
         x, y = x.cuda(), y.cuda()
         optimizer.zero_grad()
         
-        out = model(x)
-        loss = F.mse_loss(out, y)
-        loss.backward()
+        # --- 動態自迴歸滾動預測 ---
+        pred_current = x
+        total_loss = 0
+        
+        for step in range(rollout_steps):
+            pred_current = model(pred_current) # 把剛剛的預測當成新的輸入
+            total_loss += F.mse_loss(pred_current, y[:, step]) # 加上這一步的誤差
+            
+        # 總分加總，一起做反向傳播
+        total_loss.backward()
         optimizer.step()
-        train_mse += loss.item()
+        
+        train_mse += total_loss.item()
 
     scheduler.step()
     
+    # --- 測試迴圈 ---
     model.eval()
     test_mse = 0.0
     with torch.no_grad():
         for x, y in test_loader:
             x, y = x.cuda(), y.cuda()
-            out = model(x)
-            test_mse += F.mse_loss(out, y).item()
+            
+            pred_current = x
+            for step in range(rollout_steps):
+                pred_current = model(pred_current)
+                test_mse += F.mse_loss(pred_current, y[:, step]).item()
 
     train_mse /= len(train_loader)
     test_mse /= len(test_loader)
@@ -383,14 +413,23 @@ with torch.no_grad():
     # 抓取測試集的第一筆資料
     for x, y in test_loader:
         x, y = x.cuda(), y.cuda()
-        pred = model(x)
+        
+        # --- 動態滾動預測畫圖 ---
+        pred_current = x
+        for step in range(rollout_steps):
+            pred_current = model(pred_current)
+        
+        final_pred = pred_current # 儲存最後一步的結果
         break # 畫一筆就好
 
 # 將 Tensor 轉回 CPU 上的 numpy 陣列以便畫圖
-# 取 batch 中的第 0 筆資料
 idx = 0
-ground_truth = y[idx].cpu().numpy()
-prediction = pred[idx].cpu().numpy()
+time_step = rollout_steps - 1 # 0代表第一步(T+1)，1代表第二步(T+2)
+
+# 加上 [time_step] 降維，拿出對應的真實答案
+ground_truth = y[idx, time_step].cpu().numpy()
+# 拿出第二步的預測結果
+prediction = final_pred[idx].cpu().numpy()
 
 # 氣象變數名稱對應 (通道 0:溫度, 1:氣壓, 2:U風, 3:V風)
 var_names = ['Temperature (t2m)', 'Pressure (msl)', 'U-Wind', 'V-Wind']
@@ -400,13 +439,13 @@ for i in range(4):
     # 畫出真實答案 (Ground Truth)
     ax_gt = axes[i, 0]
     im_gt = ax_gt.imshow(ground_truth[:, :, i], cmap='jet')
-    ax_gt.set_title(f'True {var_names[i]}')
+    ax_gt.set_title(f'True {var_names[i]} (T+{time_step+1})')
     fig.colorbar(im_gt, ax=ax_gt)
 
     # 畫出模型預測 (Prediction)
     ax_pred = axes[i, 1]
     im_pred = ax_pred.imshow(prediction[:, :, i], cmap='jet')
-    ax_pred.set_title(f'Pred {var_names[i]}')
+    ax_pred.set_title(f'Pred {var_names[i]} (T+{time_step+1})')
     fig.colorbar(im_pred, ax=ax_pred)
 
 plt.tight_layout()
@@ -416,7 +455,6 @@ print("繪圖完成！請查看專案資料夾下的 weather_prediction.png")
 print("正在繪製 3D 球體預測圖...")
 
 # 取出模型預測的溫度資料 (第 0 個通道)
-# 確保資料形狀是 (33, 64)
 temp_pred = prediction[:, :, 0]
 
 # 1. 建立球面網格 (經度 0~2pi, 緯度 0~pi)
@@ -437,13 +475,8 @@ colors = plt.cm.jet(temp_norm)
 # 4. 繪製 3D 球體
 fig = plt.figure(figsize=(10, 10))
 ax = fig.add_subplot(111, projection='3d')
-
-# 關閉座標軸背景，讓地球懸浮在太空中
 ax.axis('off')
-
-# 繪製曲面 (plot_surface)
 surf = ax.plot_surface(X, Y, Z, facecolors=colors, rstride=1, cstride=1, antialiased=True, shade=False)
-
-ax.set_title("Global Temperature Prediction (SFNO)", fontsize=16, pad=20)
+ax.set_title(f"Global Temp Prediction Step 2 (SFNO)", fontsize=16, pad=20)
 plt.savefig('weather_prediction_3d.png', dpi=300, bbox_inches='tight')
-print("3D 繪圖完成！請查看 weather_prediction_3d.png")
+print("3D 繪圖完成！")
