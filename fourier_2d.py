@@ -11,6 +11,14 @@ from torch.nn.parameter import Parameter
 import xarray as xr   # <--- 補上這行
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
+# --- 新增：強制載入 Windows 系統內的微軟正黑體 ---
+font_path = r"C:\Windows\Fonts\msjh.ttc"
+font_manager.fontManager.addfont(font_path)
+# --- 新增：解決 Matplotlib 中文顯示為方塊的問題 ---
+plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei'] # 設定字體為微軟正黑體
+plt.rcParams['axes.unicode_minus'] = False # 解決座標軸負號 (-) 變方塊的問題
+
 import pandas as pd
 
 import operator
@@ -286,8 +294,7 @@ epochs = 50
 
 print("正在讀取 ERA5 氣象資料...")
 # 請確保你的檔案名稱與路徑正確，如果不同請修改這裡
-ds = xr.open_dataset('data/global_era5_mini_202301.nc', engine='h5netcdf') # 改成這顆迷你地球
-
+ds = xr.open_mfdataset('data/global_era5_mini_*.nc', engine='h5netcdf', combine='by_coords')
 # 提取資料並轉換成 PyTorch Tensor
 t2m = torch.tensor(ds['t2m'].values)
 msl = torch.tensor(ds['msl'].values)
@@ -331,12 +338,12 @@ for i in range(1, rollout_steps + 1):
 # 將未來的答案堆疊在一起，維度變成 (batch, rollout_steps, lat, lon, channels)
 y_data = torch.stack(y_list, dim=1) 
 
-x_train, y_train = x_data[:100], y_data[:100]
-x_test, y_test   = x_data[100:], y_data[100:]
+# 前兩年 (2021, 2022) 當訓練集，1460 * 2 = 2920 筆
+train_size = 2920 
 
-# 切割訓練集 (前 100 筆) 與測試集 (後 23 筆)
-x_train, y_train = x_data[:100], y_data[:100]
-x_test, y_test   = x_data[100:], y_data[100:]
+x_train, y_train = x_data[:train_size], y_data[:train_size]
+# 剩下的最後一年 (2023) 全部當作驗證測試集！
+x_test, y_test   = x_data[train_size:], y_data[train_size:]
 
 # 資料標準化 Normalization (氣象資料必做，否則數值差異太大無法收斂)
 x_mean, x_std = x_train.mean(dim=(0, 1, 2), keepdim=True), x_train.std(dim=(0, 1, 2), keepdim=True)
@@ -462,7 +469,6 @@ print("學習曲線繪製完成！請查看 learning_curve.png")
 ################################################################
 # 5. 視覺化預測結果 (畫圖)
 ################################################################
-import matplotlib.pyplot as plt
 
 print("正在繪製預測結果...")
 model.eval()
