@@ -354,7 +354,7 @@ test_loader  = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test
 # 訓練與評估 (取代原本的 training and evaluation)
 ################################################################
 # 這裡切換為 unet，準備跑你的 U-FNO 創新組
-model = FNO2d(modes, modes, width, local_type='advanced_unet').cuda()
+model = FNO2d(modes, modes, width, local_type='advanced_unet')
 print(f"模型總參數數量: {count_params(model)}")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
@@ -385,7 +385,7 @@ for ep in range(epochs):
     t1 = default_timer()
     train_mse = 0
     for x, y in train_loader:
-        x, y = x.cuda(), y.cuda()
+        x, y = x, y
         optimizer.zero_grad()
         
         # --- 動態自迴歸滾動預測 ---
@@ -420,7 +420,7 @@ for ep in range(epochs):
     test_mse = 0.0
     with torch.no_grad():
         for x, y in test_loader:
-            x, y = x.cuda(), y.cuda()
+            x, y = x.cpu(), y.cpu()
             
             current_input = x
             for step in range(rollout_steps):
@@ -469,7 +469,7 @@ model.eval()
 with torch.no_grad():
     # 抓取測試集的第一筆資料
     for x, y in test_loader:
-        x, y = x.cuda(), y.cuda()
+        x, y = x.cpu(), y.cpu()
         
         # --- 動態滾動預測畫圖 ---
         current_input = x
@@ -495,30 +495,56 @@ prediction = final_pred[idx].cpu().numpy()
 
 # 氣象變數名稱對應 (通道 0:溫度, 1:氣壓, 2:U風, 3:V風)
 # 氣象變數名稱對應 (通道 0:溫度, 1:氣壓, 2:U風, 3:V風)
+# ==========================================
+# (修改後的程式碼 - 替換原本同一個位置)
+# ==========================================
+
+# ... (中間這段程式碼保持不變，直到底下這幾行) ...
+
+# 氣象變數名稱對應 (通道 0:溫度, 1:氣壓, 2:U風, 3:V風)
 var_names = ['Temperature (t2m)', 'Pressure (msl)', 'U-Wind', 'V-Wind']
 
 # --- 新增：計算誤差 (True - Pred) ---
 error_map = ground_truth - prediction
 
+# ------------------------------------------
+# --- [新增/修改]: 計算地理座標範圍 (地理座標化) ---
+# 1. 從原本的 Dataset ds 中抓出經緯度 array
+lons = ds['longitude'].values # 範圍應該是 0 ~ 360
+lats = ds['latitude'].values  # 範圍應該是 90 ~ -90
+
+# 2. 定義繪圖的 extent [xmin, xmax, ymin, ymax]
+# 注意：ERA5 的緯度通常是從 90 (北極) 降到 -90 (南極)，所以 ymin=-90, ymax=90。
+g_extent = [lons.min(), lons.max(), lats.min(), lats.max()] # 例如 [0, 359.9, -90, 90]
+# ------------------------------------------
+
 # 改成 4 行 3 列 (True, Pred, Error)，把圖片加寬到 figsize=(15, 16)
+# 在 for i in range(4): 迴圈正上方，直接定義這個範圍
+# ERA5 數據標準範圍：經度 0~360, 緯度 90~-90
+# --- 1. 先定義座標範圍 ---
+g_extent = [0, 360, -90, 90] 
+
+# --- 2. 繪圖區塊 ---
 fig, axes = plt.subplots(4, 3, figsize=(15, 16))
 for i in range(4):
-    # 1. 畫出真實答案 (Ground Truth)
+    # 畫出真實答案
+   # 1. 畫出真實答案 (Ground Truth)
     ax_gt = axes[i, 0]
-    im_gt = ax_gt.imshow(ground_truth[:, :, i], cmap='jet')
+    im_gt = ax_gt.imshow(ground_truth[:, :, i], cmap='jet', extent=g_extent, aspect='auto')
     ax_gt.set_title(f'True {var_names[i]} (T+{time_step+1})')
+    ax_gt.set_ylabel('Latitude')
     fig.colorbar(im_gt, ax=ax_gt)
 
     # 2. 畫出模型預測 (Prediction)
     ax_pred = axes[i, 1]
-    im_pred = ax_pred.imshow(prediction[:, :, i], cmap='jet')
+    im_pred = ax_pred.imshow(prediction[:, :, i], cmap='jet', extent=g_extent, aspect='auto')
     ax_pred.set_title(f'Pred {var_names[i]} (T+{time_step+1})')
+    ax_pred.set_xlabel('Longitude')
     fig.colorbar(im_pred, ax=ax_pred)
     
     # 3. 畫出誤差圖 (Error Map)
     ax_err = axes[i, 2]
-    # 誤差圖我們用 'coolwarm' 顏色表：紅色代表真實大於預測(低估)，藍色代表真實小於預測(高估)，白色代表完美預測！
-    im_err = ax_err.imshow(error_map[:, :, i], cmap='coolwarm')
+    im_err = ax_err.imshow(error_map[:, :, i], cmap='coolwarm', extent=g_extent, aspect='auto')
     ax_err.set_title(f'Error (True - Pred) {var_names[i]}')
     fig.colorbar(im_err, ax=ax_err)
 
