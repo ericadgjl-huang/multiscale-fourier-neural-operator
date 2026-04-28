@@ -285,89 +285,86 @@ class FNO2d(nn.Module):
         return torch.cat((gridx, gridy), dim=-1).to(device)
 
 ################################################################
-# 讀取 ERA5 氣象資料與設定 (取代原本的 configurations 與 read data)
+# ERA5RolloutDataset：動態切片，避免預先建構龐大 y_data 張量
+# 40 步版本若預先建構 y_data 會消耗 ~12 GB RAM，改用 Dataset 即時切片
 ################################################################
-modes = 16    # 從 8 提升到 16 (因為空間變大了，最高其實可以設到 161//2=80，但 16 是一個兼具速度與精度的甜蜜點)
-width = 32
-batch_size = 4
-epochs = 50
+class ERA5RolloutDataset(torch.utils.data.Dataset):
+    def __init__(self, data, start_idx, count, rollout_steps):
+        self.data = data
+        self.start_idx = start_idx
+        self.count = count
+        self.rollout_steps = rollout_steps
+
+    def __len__(self):
+        return self.count
+
+    def __getitem__(self, idx):
+        i = self.start_idx + idx
+        x = self.data[i]                                    # (33, 64, 8)
+        y = self.data[i + 1 : i + 1 + self.rollout_steps]  # (rollout_steps, 33, 64, 8)
+        return x, y
+
+################################################################
+# 讀取 ERA5 氣象資料與設定
+################################################################
+modes         = 16
+width         = 32
+batch_size    = 4
+epochs        = 50
+rollout_steps = 40   # 10 天中期預測（6 小時/步 × 40 步 = 240 小時）
+TBPTT_K       = 8    # Truncated BPTT 視窗：每 8 步截斷計算圖，防止 40 步梯度鏈導致記憶體爆炸
+step_loss_gamma = 0.95  # 越遠的時步誤差權重遞減，避免遠期梯度淹沒近期學習訊號
 
 print("正在讀取 ERA5 氣象資料...")
-# 請確保你的檔案名稱與路徑正確，如果不同請修改這裡
 ds = xr.open_mfdataset('data/global_era5_mini_*.nc', engine='h5netcdf', combine='by_coords')
-# 提取資料並轉換成 PyTorch Tensor
+
 t2m = torch.tensor(ds['t2m'].values)
 msl = torch.tensor(ds['msl'].values)
 u10 = torch.tensor(ds['u10'].values)
 v10 = torch.tensor(ds['v10'].values)
 
-# --- 幫模型裝上「時鐘」 (Time Embedding) ---
-# 1. 抓出 NetCDF 裡面的時間戳記
-times = ds['valid_time'].values
-dt = pd.to_datetime(times)
+times    = ds['valid_time'].values
+dt       = pd.to_datetime(times)
+day_rad  = torch.tensor(dt.dayofyear.values, dtype=torch.float32) * (2 * np.pi / 365.25)
+hour_rad = torch.tensor(dt.hour.values,      dtype=torch.float32) * (2 * np.pi / 24.0)
 
-# 2. 將 365 天與 24 小時轉換成圓周上的弧度
-day_rad = torch.tensor(dt.dayofyear.values, dtype=torch.float32) * (2 * np.pi / 365.25)
-hour_rad = torch.tensor(dt.hour.values, dtype=torch.float32) * (2 * np.pi / 24.0)
-
-# 3. 算出 sin 和 cos，並將形狀擴張 (Broadcast) 到與氣象圖一樣的空間大小 (33, 64)
-day_sin = torch.sin(day_rad).view(-1, 1, 1).expand(-1, 33, 64)
-day_cos = torch.cos(day_rad).view(-1, 1, 1).expand(-1, 33, 64)
+day_sin  = torch.sin(day_rad).view(-1, 1, 1).expand(-1, 33, 64)
+day_cos  = torch.cos(day_rad).view(-1, 1, 1).expand(-1, 33, 64)
 hour_sin = torch.sin(hour_rad).view(-1, 1, 1).expand(-1, 33, 64)
 hour_cos = torch.cos(hour_rad).view(-1, 1, 1).expand(-1, 33, 64)
 
-# 4. 把 4 個氣象變數 + 4 個時間變數，疊合成 8 個通道！
 data = torch.stack([t2m, msl, u10, v10, day_sin, day_cos, hour_sin, hour_cos], dim=-1)
-data = torch.nan_to_num(data, nan=0.0) # 填補可能的空值
-# 建立預測序列：X 是現在 (0~122), Y 是未來 (1~123)
-# x_data = data[:-1, :, :, :]
-# y_data = data[1:, :, :, :]
+data = torch.nan_to_num(data, nan=0.0).float()
 
-# --- 動態多步滾動設定 ---
-rollout_steps = 4  #我們先挑戰連續預測 4 步 (相當於未來 24 小時)
-x_data = data[:-rollout_steps, :, :, :]
+# 前兩年 (2021-2022) 訓練，最後一年 (2023) 測試
+train_size = 2920
+total_size = len(data)
 
-# 用 Python 的 List Comprehension 動態抓出未來每一步的答案
-y_list = []
-for i in range(1, rollout_steps + 1):
-    if i == rollout_steps:
-        y_list.append(data[i:, :, :, :])
-    else:
-        y_list.append(data[i : -rollout_steps + i, :, :, :])
+# 標準化：僅用訓練集統計量，防止資料洩漏到測試集
+x_mean    = data[:train_size].mean(dim=(0, 1, 2))  # (8,)
+x_std     = data[:train_size].std(dim=(0, 1, 2))   # (8,)
+data_norm = (data - x_mean) / (x_std + 1e-6)
 
-# 將未來的答案堆疊在一起，維度變成 (batch, rollout_steps, lat, lon, channels)
-y_data = torch.stack(y_list, dim=1) 
+train_dataset = ERA5RolloutDataset(data_norm, start_idx=0,
+                                   count=train_size,
+                                   rollout_steps=rollout_steps)
+test_dataset  = ERA5RolloutDataset(data_norm, start_idx=train_size,
+                                   count=total_size - train_size - rollout_steps,
+                                   rollout_steps=rollout_steps)
 
-# 前兩年 (2021, 2022) 當訓練集，1460 * 2 = 2920 筆
-train_size = 2920 
-
-x_train, y_train = x_data[:train_size], y_data[:train_size]
-# 剩下的最後一年 (2023) 全部當作驗證測試集！
-x_test, y_test   = x_data[train_size:], y_data[train_size:]
-
-# 資料標準化 Normalization (氣象資料必做，否則數值差異太大無法收斂)
-x_mean, x_std = x_train.mean(dim=(0, 1, 2), keepdim=True), x_train.std(dim=(0, 1, 2), keepdim=True)
-
-# 統一使用 x_mean 與 x_std 進行正規化，因為 x 是 4D，y 是 5D，PyTorch 會自動從右邊對齊完美廣播！
-x_train = (x_train - x_mean) / (x_std + 1e-6)
-x_test  = (x_test - x_mean) / (x_std + 1e-6)
-y_train = (y_train - x_mean) / (x_std + 1e-6)
-y_test  = (y_test - x_mean) / (x_std + 1e-6)
-
-train_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_train, y_train), batch_size=batch_size, shuffle=True)
-test_loader  = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x_test, y_test), batch_size=batch_size, shuffle=False)
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader  = torch.utils.data.DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
 ################################################################
-# 訓練與評估 (取代原本的 training and evaluation)
+# 訓練與評估
 ################################################################
-# 這裡切換為 unet，準備跑你的 U-FNO 創新組
 model = FNO2d(modes, modes, width, local_type='advanced_unet').cuda()
 print(f"模型總參數數量: {count_params(model)}")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+# CosineAnnealing 比 StepLR 更適合長步預測：學習率平滑衰減，避免後期震盪
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
-# 自動判斷實驗名稱
 if model.local_type == 'unet':
     model_name = "U-FNO (極簡版)"
 elif model.local_type == 'advanced_unet':
@@ -379,184 +376,208 @@ else:
 
 print(f"========================================")
 print(f" 正在啟動訓練：{model_name}")
-print(f" 局部路徑類型：{model.local_type}")
+print(f" 預測步數：{rollout_steps} 步（{rollout_steps * 6 // 24} 天）")
+print(f" T-BPTT 視窗：{TBPTT_K} 步")
 print(f" 模型總參數：{count_params(model)}")
 print(f"========================================")
 
-# --- 新增：準備紀錄學習曲線的陣列 ---
+# 各時步損失加權係數（step 0 權重最高，越遠越輕）
+step_weights = torch.tensor(
+    [step_loss_gamma ** i for i in range(rollout_steps)], dtype=torch.float32
+).cuda()
+
 history_train_mse = []
-history_test_mse = []
+history_test_mse  = []
 
 for ep in range(epochs):
     model.train()
-    t1 = default_timer()
-    train_mse = 0
+    t1        = default_timer()
+    train_mse = 0.0
+
     for x, y in train_loader:
         x, y = x.cuda(), y.cuda()
-        optimizer.zero_grad()
-        
-        # --- 動態自迴歸滾動預測 ---
         current_input = x
-        total_loss = 0
-        
-        for step in range(rollout_steps):
-            # 1. 預測下一步的氣象 (輸出只有 4 個通道)
-            pred_weather = model(current_input) 
-            
-            # 2. 只抽出標準答案的「前 4 個氣象變數」來算 Loss
-            true_weather = y[:, step, :, :, :4]
-            total_loss += F.mse_loss(pred_weather, true_weather) 
-            
-            # 3. 準備下一次滾動的輸入！(結合 預測天氣 + 未來時間)
-            if step < rollout_steps - 1:
-                # 拿出下一步的「真實時間」通道 (索引 4~7)
-                next_time_features = y[:, step, :, :, 4:]
-                # 將「預測的氣象」與「未來的時間」像三明治一樣疊起來，成為完整的 8 通道輸入
-                current_input = torch.cat([pred_weather, next_time_features], dim=-1)
-            
-        # 總分加總，一起做反向傳播
-        total_loss.backward()
-        optimizer.step()
-        
-        train_mse += total_loss.item()
+        batch_mse     = 0.0
+
+        # --- Truncated BPTT：每 TBPTT_K 步做一次梯度更新 ---
+        # 好處：把 40 步的計算圖切成 5 段，每段只需要保留 8 步的梯度，
+        #       GPU 記憶體使用量與原本 4 步訓練相近。
+        for window_start in range(0, rollout_steps, TBPTT_K):
+            window_end  = min(window_start + TBPTT_K, rollout_steps)
+            optimizer.zero_grad()
+            window_loss = torch.tensor(0.0, device=x.device)
+
+            for step in range(window_start, window_end):
+                pred_weather = model(current_input)
+                true_weather = y[:, step, :, :, :4]
+                step_loss    = step_weights[step] * F.mse_loss(pred_weather, true_weather)
+                window_loss  = window_loss + step_loss
+                batch_mse   += F.mse_loss(pred_weather, true_weather).item()
+
+                if step < rollout_steps - 1:
+                    next_time     = y[:, step, :, :, 4:]
+                    current_input = torch.cat([pred_weather, next_time], dim=-1)
+
+            window_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            # 在 T-BPTT 視窗邊界截斷計算圖，讓下一段從乾淨狀態開始
+            current_input = current_input.detach()
+
+        train_mse += batch_mse / rollout_steps
 
     scheduler.step()
-    
-    # --- 測試迴圈 ---
+
+    # --- 測試迴圈（無梯度，純前向推演）---
     model.eval()
     test_mse = 0.0
     with torch.no_grad():
         for x, y in test_loader:
             x, y = x.cuda(), y.cuda()
-            
             current_input = x
             for step in range(rollout_steps):
-                # 預測氣象 (4通道)
                 pred_weather = model(current_input)
-                # 拿答案的前 4 個氣象通道算誤差
                 true_weather = y[:, step, :, :, :4]
-                test_mse += F.mse_loss(pred_weather, true_weather).item()
-                
-                # 準備下一步的輸入
+                test_mse    += F.mse_loss(pred_weather, true_weather).item()
                 if step < rollout_steps - 1:
-                    next_time_features = y[:, step, :, :, 4:]
-                    current_input = torch.cat([pred_weather, next_time_features], dim=-1)
+                    next_time     = y[:, step, :, :, 4:]
+                    current_input = torch.cat([pred_weather, next_time], dim=-1)
 
     train_mse /= len(train_loader)
-    test_mse /= len(test_loader)
-    t2 = default_timer()
-    print(f"Epoch: {ep} | 耗時: {t2-t1:.2f}s | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}")
+    test_mse  /= (len(test_loader) * rollout_steps)
+    t2         = default_timer()
+    print(f"Epoch {ep:02d} | 耗時: {t2-t1:.1f}s | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}")
 
-    # --- 新增：把每一圈的分數存起來 ---
     history_train_mse.append(train_mse)
     history_test_mse.append(test_mse)
-# ==========================================
-# (原本的訓練迴圈到這裡結束，注意縮排要退回最外層！)
-# ==========================================
 
-# --- 新增：訓練結束後，繪製學習曲線 ---
+# --- 學習曲線 ---
 plt.figure(figsize=(10, 6))
 plt.plot(history_train_mse, label='Train MSE', linewidth=2)
-plt.plot(history_test_mse, label='Test MSE', linewidth=2)
+plt.plot(history_test_mse,  label='Test MSE',  linewidth=2)
 plt.xlabel('Epochs', fontsize=14)
 plt.ylabel('MSE Loss', fontsize=14)
-plt.title(f'Learning Curve - {model_name}', fontsize=16)
+plt.title(f'Learning Curve — {model_name} ({rollout_steps * 6 // 24}-Day Forecast)', fontsize=16)
 plt.legend(fontsize=12)
 plt.grid(True)
 plt.savefig('learning_curve.png', dpi=300, bbox_inches='tight')
 plt.close()
 print("學習曲線繪製完成！請查看 learning_curve.png")
-################################################################
-# 5. 視覺化預測結果 (畫圖)
-################################################################
 
-print("正在繪製預測結果...")
+################################################################
+# 視覺化 1：各預報時效分通道 RMSE（技巧分數圖）
+################################################################
+print("正在計算分通道預報技巧分數（RMSE vs Lead Time）...")
+
+var_names_zh = ['溫度 t2m', '海平面氣壓 msl', 'U 風速', 'V 風速']
+var_names_en = ['Temperature (t2m)', 'Pressure (msl)', 'U-Wind', 'V-Wind']
+lead_hours   = np.arange(1, rollout_steps + 1) * 6   # 6, 12, ..., 240 小時
+
+channel_step_rmse = np.zeros((4, rollout_steps))
+n_skill_batches   = 0
 model.eval()
 with torch.no_grad():
-    # 抓取測試集的第一筆資料
     for x, y in test_loader:
         x, y = x.cuda(), y.cuda()
-        
-        # --- 動態滾動預測畫圖 ---
         current_input = x
+        step_preds    = []
         for step in range(rollout_steps):
             pred_weather = model(current_input)
-            
+            step_preds.append(pred_weather.cpu())
             if step < rollout_steps - 1:
-                next_time_features = y[:, step, :, :, 4:]
-                current_input = torch.cat([pred_weather, next_time_features], dim=-1)
-        
-        final_pred = pred_weather # 儲存最後一步的結果
-        break # 畫一筆就好
+                next_time     = y[:, step, :, :, 4:]
+                current_input = torch.cat([pred_weather, next_time], dim=-1)
+        for step in range(rollout_steps):
+            true = y[:, step, :, :, :4].cpu().numpy()
+            pred = step_preds[step].numpy()
+            for ch in range(4):
+                channel_step_rmse[ch, step] += np.sqrt(
+                    np.mean((pred[:, :, :, ch] - true[:, :, :, ch]) ** 2)
+                )
+        n_skill_batches += 1
+        if n_skill_batches >= 10:  # 前 10 批足夠評估趨勢
+            break
 
-# 將 Tensor 轉回 CPU 上的 numpy 陣列以便畫圖
-idx = 0
-time_step = rollout_steps - 1 # 0代表第一步(T+1)
+channel_step_rmse /= n_skill_batches
 
-# 加上 [time_step] 降維，並只拿出前 4 個「氣象通道」的真實答案
-ground_truth = y[idx, time_step, :, :, :4].cpu().numpy()
-
-# 拿出最後一步的預測結果 
-prediction = final_pred[idx].cpu().numpy()
-
-# 氣象變數名稱對應 (通道 0:溫度, 1:氣壓, 2:U風, 3:V風)
-# 氣象變數名稱對應 (通道 0:溫度, 1:氣壓, 2:U風, 3:V風)
-var_names = ['Temperature (t2m)', 'Pressure (msl)', 'U-Wind', 'V-Wind']
-
-# --- 新增：計算誤差 (True - Pred) ---
-error_map = ground_truth - prediction
-
-# 改成 4 行 3 列 (True, Pred, Error)，把圖片加寬到 figsize=(15, 16)
-fig, axes = plt.subplots(4, 3, figsize=(15, 16))
-for i in range(4):
-    # 1. 畫出真實答案 (Ground Truth)
-    ax_gt = axes[i, 0]
-    im_gt = ax_gt.imshow(ground_truth[:, :, i], cmap='jet')
-    ax_gt.set_title(f'True {var_names[i]} (T+{time_step+1})')
-    fig.colorbar(im_gt, ax=ax_gt)
-
-    # 2. 畫出模型預測 (Prediction)
-    ax_pred = axes[i, 1]
-    im_pred = ax_pred.imshow(prediction[:, :, i], cmap='jet')
-    ax_pred.set_title(f'Pred {var_names[i]} (T+{time_step+1})')
-    fig.colorbar(im_pred, ax=ax_pred)
-    
-    # 3. 畫出誤差圖 (Error Map)
-    ax_err = axes[i, 2]
-    # 誤差圖我們用 'coolwarm' 顏色表：紅色代表真實大於預測(低估)，藍色代表真實小於預測(高估)，白色代表完美預測！
-    im_err = ax_err.imshow(error_map[:, :, i], cmap='coolwarm')
-    ax_err.set_title(f'Error (True - Pred) {var_names[i]}')
-    fig.colorbar(im_err, ax=ax_err)
-
+fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+for ch, ax in enumerate(axes):
+    ax.plot(lead_hours, channel_step_rmse[ch], linewidth=2, color=f'C{ch}')
+    ax.set_title(f'{var_names_en[ch]} RMSE vs Lead Time', fontsize=11)
+    ax.set_xlabel('Forecast Lead Time (hours)', fontsize=10)
+    ax.set_ylabel('RMSE (normalized)', fontsize=10)
+    ax.axvline(x=120, color='orange', linestyle='--', alpha=0.8, label='Day 5')
+    ax.axvline(x=240, color='red',    linestyle='--', alpha=0.8, label='Day 10')
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.4)
+plt.suptitle(f'Forecast Skill — {model_name}', fontsize=14, fontweight='bold')
 plt.tight_layout()
-plt.savefig('weather_prediction.png')
-print("繪圖完成！請查看專案資料夾下的 weather_prediction.png")
+plt.savefig('forecast_skill.png', dpi=300, bbox_inches='tight')
+plt.close()
+print("技巧分數圖繪製完成！請查看 forecast_skill.png")
 
+################################################################
+# 視覺化 2：多時效誤差熱點圖（Day 1 / Day 3 / Day 7 / Day 10）
+################################################################
+print("正在繪製多時效誤差熱點圖...")
+
+# 展示 4 個代表性時效（溫度通道）
+target_steps  = [3, 11, 27, 39]   # 0-indexed：T+4/12/28/40 步
+target_labels = ['Day 1 (T+4)', 'Day 3 (T+12)', 'Day 7 (T+28)', 'Day 10 (T+40)']
+
+model.eval()
+with torch.no_grad():
+    for x, y in test_loader:
+        x, y = x.cuda(), y.cuda()
+        current_input = x
+        all_preds     = []
+        for step in range(rollout_steps):
+            pred_weather = model(current_input)
+            all_preds.append(pred_weather)
+            if step < rollout_steps - 1:
+                next_time     = y[:, step, :, :, 4:]
+                current_input = torch.cat([pred_weather, next_time], dim=-1)
+        break  # 只畫第一批
+
+idx = 0
+fig, axes = plt.subplots(len(target_steps), 3, figsize=(15, len(target_steps) * 4))
+for row, (ts, label) in enumerate(zip(target_steps, target_labels)):
+    gt   = y[idx, ts, :, :, 0].cpu().numpy()           # 溫度通道 ground truth
+    pred = all_preds[ts][idx, :, :, 0].cpu().numpy()   # 溫度通道預測
+    err  = gt - pred
+
+    im0 = axes[row, 0].imshow(gt,   cmap='jet');      axes[row, 0].set_title(f'True {label}');   fig.colorbar(im0, ax=axes[row, 0])
+    im1 = axes[row, 1].imshow(pred, cmap='jet');      axes[row, 1].set_title(f'Pred {label}');   fig.colorbar(im1, ax=axes[row, 1])
+    im2 = axes[row, 2].imshow(err,  cmap='coolwarm'); axes[row, 2].set_title(f'Error {label}');  fig.colorbar(im2, ax=axes[row, 2])
+
+plt.suptitle(f'Temperature Prediction Error Maps — {model_name}', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig('weather_prediction.png', dpi=300, bbox_inches='tight')
+plt.close()
+print("多時效誤差熱點圖繪製完成！請查看 weather_prediction.png")
+
+################################################################
+# 視覺化 3：3D 球體預測圖（Day 10 最終時效）
+################################################################
 print("正在繪製 3D 球體預測圖...")
+temp_pred = all_preds[-1][idx, :, :, 0].cpu().numpy()
 
-# 取出模型預測的溫度資料 (第 0 個通道)
-temp_pred = prediction[:, :, 0]
-
-# 1. 建立球面網格 (經度 0~2pi, 緯度 0~pi)
 lon = np.linspace(0, 2 * np.pi, 64)
 lat = np.linspace(0, np.pi, 33)
 lon, lat = np.meshgrid(lon, lat)
-
-# 2. 將球面座標 (lat, lon) 轉換為 3D 笛卡兒座標 (X, Y, Z)
 X = np.sin(lat) * np.cos(lon)
 Y = np.sin(lat) * np.sin(lon)
 Z = np.cos(lat)
 
-# 3. 將溫度資料標準化到 0~1，以便對應顏色表 (Colormap)
 temp_norm = (temp_pred - temp_pred.min()) / (temp_pred.max() - temp_pred.min() + 1e-6)
-# 生成顏色矩陣
-colors = plt.cm.jet(temp_norm)
+colors    = plt.cm.jet(temp_norm)
 
-# 4. 繪製 3D 球體
 fig = plt.figure(figsize=(10, 10))
-ax = fig.add_subplot(111, projection='3d')
+ax  = fig.add_subplot(111, projection='3d')
 ax.axis('off')
-surf = ax.plot_surface(X, Y, Z, facecolors=colors, rstride=1, cstride=1, antialiased=True, shade=False)
-ax.set_title(f"Global Temp Prediction Step {rollout_steps}", fontsize=16, pad=20)
+ax.plot_surface(X, Y, Z, facecolors=colors, rstride=1, cstride=1, antialiased=True, shade=False)
+ax.set_title(f"Global Temp Prediction — Day {rollout_steps * 6 // 24} Forecast", fontsize=16, pad=20)
 plt.savefig('weather_prediction_3d.png', dpi=300, bbox_inches='tight')
+plt.close()
 print("3D 繪圖完成！")
