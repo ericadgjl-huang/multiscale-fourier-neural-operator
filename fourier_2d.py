@@ -21,6 +21,10 @@ plt.rcParams['axes.unicode_minus'] = False # 解決座標軸負號 (-) 變方塊
 
 import pandas as pd
 
+import os
+import json
+import csv
+
 import operator
 from functools import reduce
 from functools import partial
@@ -194,34 +198,28 @@ class ConvNeXtBlock2d(nn.Module):
         return x + res
 
 class FNO2d(nn.Module):
-    def __init__(self, modes1, modes2,  width, local_type='1x1'):
+    def __init__(self, modes1, modes2, width, local_type='1x1', spectral_type='sht'):
         super(FNO2d, self).__init__()
 
         """
-        The overall network. It contains 4 layers of the Fourier layer.
-        1. Lift the input to the desire channel dimension by self.fc0 .
-        2. 4 layers of the integral operators u' = (W + K)(u).
-            W defined by self.w; K defined by self.conv .
-        3. Project from the channel space to the output space by self.fc1 and self.fc2 .
-        
-        input: the solution of the coefficient function and locations (a(x, y), x, y)
-        input shape: (batchsize, x=s, y=s, c=3)
-        output: the solution 
-        output shape: (batchsize, x=s, y=s, c=1)
+        4 層 spectral block + 4 層 local path 的混合結構。
+        spectral_type: 'sht'（球面調和，SFNO 系列）或 'fft'（標準 2D-FNO）
+        local_type:    '1x1' / 'unet' / 'advanced_unet' / 'convnext'
         """
 
         self.modes1 = modes1
         self.modes2 = modes2
         self.width = width
-        # self.padding = 9 # pad the domain if input is non-periodic
-        self.fc0 = nn.Linear(10, self.width) # input channel is 10: (a(x, y), x, y, x^2, y^2, xy, day_sin, day_cos, hour_sin, hour_cos)
-        self.local_type = local_type # 儲存實驗開關
+        self.fc0 = nn.Linear(10, self.width)
+        self.local_type    = local_type
+        self.spectral_type = spectral_type
 
-        # 換上全新的球面調和引擎！注意參數只傳入 modes1 即可
-        self.conv0 = SphericalConv2d(self.width, self.width, self.modes1)
-        self.conv1 = SphericalConv2d(self.width, self.width, self.modes1)
-        self.conv2 = SphericalConv2d(self.width, self.width, self.modes1)
-        self.conv3 = SphericalConv2d(self.width, self.width, self.modes1)
+        # spectral path：FFT 或 SHT 二選一
+        self.conv0 = self._get_spectral_path()
+        self.conv1 = self._get_spectral_path()
+        self.conv2 = self._get_spectral_path()
+        self.conv3 = self._get_spectral_path()
+        # local path：1x1 / U-Net / Advanced U-Net / ConvNeXt
         self.w0 = self._get_local_path()
         self.w1 = self._get_local_path()
         self.w2 = self._get_local_path()
@@ -230,12 +228,19 @@ class FNO2d(nn.Module):
         self.fc1 = nn.Linear(self.width, 128)
         self.fc2 = nn.Linear(128, 4)
 
+    def _get_spectral_path(self):
+        if self.spectral_type == 'sht':
+            return SphericalConv2d(self.width, self.width, self.modes1)
+        elif self.spectral_type == 'fft':
+            return SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+        else:
+            raise ValueError(f"Unknown spectral_type: {self.spectral_type}")
+
     def _get_local_path(self):
         if self.local_type == '1x1':
             return nn.Conv2d(self.width, self.width, 1)
         elif self.local_type == 'unet':
             return LocalUNetBlock2d(self.width)
-        # --- 新增下面這兩行 ---
         elif self.local_type == 'advanced_unet':
             return AdvancedUNetBlock2d(self.width)
         elif self.local_type == 'convnext':
@@ -305,15 +310,38 @@ class ERA5RolloutDataset(torch.utils.data.Dataset):
         return x, y
 
 ################################################################
+# 實驗設定（切換架構只需改 experiment_name 一行！）
+################################################################
+EXPERIMENTS = {
+    '2d_fno':      {'local_type': '1x1',           'spectral_type': 'fft', 'display': '2D-FNO Baseline (FFT)'},
+    'sfno':        {'local_type': '1x1',           'spectral_type': 'sht', 'display': 'SFNO (Spherical Baseline)'},
+    'sufno':       {'local_type': 'unet',          'spectral_type': 'sht', 'display': 'SUFNO (Spherical + U-Net)'},
+    'sunetpp_fno': {'local_type': 'advanced_unet', 'spectral_type': 'sht', 'display': 'SU-Net++ FNO (Spherical + Advanced U-Net)'},
+}
+
+experiment_name = 'sunetpp_fno'   # ← 改這一行就能切換 4 個實驗！
+cfg = EXPERIMENTS[experiment_name]
+
+output_dir = os.path.join('outputs', experiment_name)
+os.makedirs(output_dir, exist_ok=True)
+print(f"========================================")
+print(f" 實驗：{experiment_name}  →  {cfg['display']}")
+print(f" 輸出資料夾：{output_dir}")
+print(f"========================================")
+
+################################################################
 # 讀取 ERA5 氣象資料與設定
 ################################################################
-modes         = 16
-width         = 32
-batch_size    = 4
-epochs        = 50
-rollout_steps = 40   # 10 天中期預測（6 小時/步 × 40 步 = 240 小時）
-TBPTT_K       = 8    # Truncated BPTT 視窗：每 8 步截斷計算圖，防止 40 步梯度鏈導致記憶體爆炸
-step_loss_gamma = 0.95  # 越遠的時步誤差權重遞減，避免遠期梯度淹沒近期學習訊號
+modes           = 16
+width           = 32
+batch_size      = 4
+epochs          = 50
+rollout_steps   = 40   # 10 天中期預測（6 小時/步 × 40 步 = 240 小時）
+TBPTT_K         = 8    # Truncated BPTT 視窗：每 8 步截斷計算圖，防止 40 步梯度鏈導致記憶體爆炸
+step_loss_gamma = 0.95 # 越遠的時步誤差權重遞減，避免遠期梯度淹沒近期學習訊號
+lr              = 0.001
+weight_decay    = 1e-4
+clip_norm       = 1.0
 
 print("正在讀取 ERA5 氣象資料...")
 ds = xr.open_mfdataset('data/global_era5_mini_*.nc', engine='h5netcdf', combine='by_coords')
@@ -358,28 +386,57 @@ test_loader  = torch.utils.data.DataLoader(test_dataset,  batch_size=batch_size,
 ################################################################
 # 訓練與評估
 ################################################################
-model = FNO2d(modes, modes, width, local_type='advanced_unet').cuda()
+model = FNO2d(modes, modes, width,
+              local_type=cfg['local_type'],
+              spectral_type=cfg['spectral_type']).cuda()
 print(f"模型總參數數量: {count_params(model)}")
 
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 # CosineAnnealing 比 StepLR 更適合長步預測：學習率平滑衰減，避免後期震盪
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
-if model.local_type == 'unet':
-    model_name = "U-FNO (極簡版)"
-elif model.local_type == 'advanced_unet':
-    model_name = "Advanced U-FNO (深層拼接版)"
-elif model.local_type == 'convnext':
-    model_name = "ConvNeXt-FNO (大卷積核版)"
-else:
-    model_name = "FNO Baseline (1x1對照組)"
+model_name = cfg['display']
 
 print(f"========================================")
 print(f" 正在啟動訓練：{model_name}")
+print(f" Spectral 引擎：{cfg['spectral_type'].upper()}")
+print(f" Local 路徑：{cfg['local_type']}")
 print(f" 預測步數：{rollout_steps} 步（{rollout_steps * 6 // 24} 天）")
 print(f" T-BPTT 視窗：{TBPTT_K} 步")
 print(f" 模型總參數：{count_params(model)}")
 print(f"========================================")
+
+# --- 把超參數快照寫進 config.json（之後可 reproduce） ---
+config_snapshot = {
+    'experiment_name': experiment_name,
+    'display_name':    cfg['display'],
+    'local_type':      cfg['local_type'],
+    'spectral_type':   cfg['spectral_type'],
+    'modes':           modes,
+    'width':           width,
+    'batch_size':      batch_size,
+    'epochs':          epochs,
+    'rollout_steps':   rollout_steps,
+    'TBPTT_K':         TBPTT_K,
+    'step_loss_gamma': step_loss_gamma,
+    'lr':              lr,
+    'weight_decay':    weight_decay,
+    'clip_norm':       clip_norm,
+    'train_size':      train_size,
+    'total_size':      total_size,
+    'param_count':     count_params(model),
+    'optimizer':       'Adam',
+    'scheduler':       'CosineAnnealingLR',
+}
+config_path = os.path.join(output_dir, 'config.json')
+with open(config_path, 'w', encoding='utf-8') as f:
+    json.dump(config_snapshot, f, indent=2, ensure_ascii=False)
+print(f"超參數快照已寫入：{config_path}")
+
+# --- 開啟 CSV 訓練紀錄（每 epoch 即時 append，意外中斷也能保留） ---
+csv_path = os.path.join(output_dir, 'training_log.csv')
+with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+    csv.writer(f).writerow(['epoch', 'train_mse', 'test_mse', 'lr', 'epoch_time_sec'])
 
 # 各時步損失加權係數（step 0 權重最高，越遠越輕）
 step_weights = torch.tensor(
@@ -419,7 +476,7 @@ for ep in range(epochs):
                     current_input = torch.cat([pred_weather, next_time], dim=-1)
 
             window_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
             optimizer.step()
 
             # 在 T-BPTT 視窗邊界截斷計算圖，讓下一段從乾淨狀態開始
@@ -427,6 +484,7 @@ for ep in range(epochs):
 
         train_mse += batch_mse / rollout_steps
 
+    current_lr = optimizer.param_groups[0]['lr']
     scheduler.step()
 
     # --- 測試迴圈（無梯度，純前向推演）---
@@ -447,10 +505,20 @@ for ep in range(epochs):
     train_mse /= len(train_loader)
     test_mse  /= (len(test_loader) * rollout_steps)
     t2         = default_timer()
-    print(f"Epoch {ep:02d} | 耗時: {t2-t1:.1f}s | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}")
+    epoch_time = t2 - t1
+    print(f"Epoch {ep:02d} | 耗時: {epoch_time:.1f}s | LR: {current_lr:.2e} | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}")
 
     history_train_mse.append(train_mse)
     history_test_mse.append(test_mse)
+
+    # 每 epoch 即時 append 到 CSV（意外中斷也能保留）
+    with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+        csv.writer(f).writerow([ep, train_mse, test_mse, current_lr, epoch_time])
+
+# --- 訓練結束後儲存模型權重 ---
+weights_path = os.path.join(output_dir, 'model_weights.pt')
+torch.save(model.state_dict(), weights_path)
+print(f"模型權重已儲存：{weights_path}")
 
 # --- 學習曲線 ---
 plt.figure(figsize=(10, 6))
@@ -461,9 +529,9 @@ plt.ylabel('MSE Loss', fontsize=14)
 plt.title(f'Learning Curve — {model_name} ({rollout_steps * 6 // 24}-Day Forecast)', fontsize=16)
 plt.legend(fontsize=12)
 plt.grid(True)
-plt.savefig('learning_curve.png', dpi=300, bbox_inches='tight')
+plt.savefig(os.path.join(output_dir, 'learning_curve.png'), dpi=300, bbox_inches='tight')
 plt.close()
-print("學習曲線繪製完成！請查看 learning_curve.png")
+print(f"學習曲線繪製完成！請查看 {os.path.join(output_dir, 'learning_curve.png')}")
 
 ################################################################
 # 視覺化 1：各預報時效分通道 RMSE（技巧分數圖）
@@ -513,9 +581,9 @@ for ch, ax in enumerate(axes):
     ax.grid(True, alpha=0.4)
 plt.suptitle(f'Forecast Skill — {model_name}', fontsize=14, fontweight='bold')
 plt.tight_layout()
-plt.savefig('forecast_skill.png', dpi=300, bbox_inches='tight')
+plt.savefig(os.path.join(output_dir, 'forecast_skill.png'), dpi=300, bbox_inches='tight')
 plt.close()
-print("技巧分數圖繪製完成！請查看 forecast_skill.png")
+print(f"技巧分數圖繪製完成！請查看 {os.path.join(output_dir, 'forecast_skill.png')}")
 
 ################################################################
 # 視覺化 2：多時效誤差熱點圖（Day 1 / Day 3 / Day 7 / Day 10）
@@ -553,9 +621,9 @@ for row, (ts, label) in enumerate(zip(target_steps, target_labels)):
 
 plt.suptitle(f'Temperature Prediction Error Maps — {model_name}', fontsize=14, fontweight='bold')
 plt.tight_layout()
-plt.savefig('weather_prediction.png', dpi=300, bbox_inches='tight')
+plt.savefig(os.path.join(output_dir, 'weather_prediction.png'), dpi=300, bbox_inches='tight')
 plt.close()
-print("多時效誤差熱點圖繪製完成！請查看 weather_prediction.png")
+print(f"多時效誤差熱點圖繪製完成！請查看 {os.path.join(output_dir, 'weather_prediction.png')}")
 
 ################################################################
 # 視覺化 3：3D 球體預測圖（Day 10 最終時效）
@@ -578,6 +646,7 @@ ax  = fig.add_subplot(111, projection='3d')
 ax.axis('off')
 ax.plot_surface(X, Y, Z, facecolors=colors, rstride=1, cstride=1, antialiased=True, shade=False)
 ax.set_title(f"Global Temp Prediction — Day {rollout_steps * 6 // 24} Forecast", fontsize=16, pad=20)
-plt.savefig('weather_prediction_3d.png', dpi=300, bbox_inches='tight')
+plt.savefig(os.path.join(output_dir, 'weather_prediction_3d.png'), dpi=300, bbox_inches='tight')
 plt.close()
-print("3D 繪圖完成！")
+print(f"3D 繪圖完成！請查看 {os.path.join(output_dir, 'weather_prediction_3d.png')}")
+print(f"\n========== 全部完成！所有結果已儲存至 {output_dir}/ ==========")
