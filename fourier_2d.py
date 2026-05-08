@@ -198,13 +198,14 @@ class ConvNeXtBlock2d(nn.Module):
         return x + res
 
 class FNO2d(nn.Module):
-    def __init__(self, modes1, modes2, width, local_type='1x1', spectral_type='sht'):
+    def __init__(self, modes1, modes2, width, local_type='1x1', spectral_type='sht', dropout=0.0):
         super(FNO2d, self).__init__()
 
         """
         4 層 spectral block + 4 層 local path 的混合結構。
         spectral_type: 'sht'（球面調和，SFNO 系列）或 'fft'（標準 2D-FNO）
         local_type:    '1x1' / 'unet' / 'advanced_unet' / 'convnext'
+        dropout:       每個 spectral block GELU 後的 Dropout2d 機率（0 = 關閉，零開銷）
         """
 
         self.modes1 = modes1
@@ -213,6 +214,7 @@ class FNO2d(nn.Module):
         self.fc0 = nn.Linear(10, self.width)
         self.local_type    = local_type
         self.spectral_type = spectral_type
+        self.dropout_p     = dropout
 
         # spectral path：FFT 或 SHT 二選一
         self.conv0 = self._get_spectral_path()
@@ -224,6 +226,9 @@ class FNO2d(nn.Module):
         self.w1 = self._get_local_path()
         self.w2 = self._get_local_path()
         self.w3 = self._get_local_path()
+
+        # Dropout（channel-wise，spatial）：dropout=0 為 Identity，零開銷
+        self.dropout_layer = nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity()
 
         self.fc1 = nn.Linear(self.width, 128)
         self.fc2 = nn.Linear(128, 4)
@@ -259,16 +264,19 @@ class FNO2d(nn.Module):
         x2 = self.w0(x)
         x = x1 + x2
         x = F.gelu(x)
+        x = self.dropout_layer(x)
 
         x1 = self.conv1(x)
         x2 = self.w1(x)
         x = x1 + x2
         x = F.gelu(x)
+        x = self.dropout_layer(x)
 
         x1 = self.conv2(x)
         x2 = self.w2(x)
         x = x1 + x2
         x = F.gelu(x)
+        x = self.dropout_layer(x)
 
         x1 = self.conv3(x)
         x2 = self.w3(x)
@@ -310,7 +318,7 @@ class ERA5RolloutDataset(torch.utils.data.Dataset):
         return x, y
 
 ################################################################
-# 實驗設定（切換架構只需改 experiment_name 一行！）
+# 實驗設定（PR 3：multi-seed + FNO hyperparam search 旋鈕）
 ################################################################
 EXPERIMENTS = {
     '2d_fno':      {'local_type': '1x1',           'spectral_type': 'fft', 'display': '2D-FNO Baseline (FFT)'},
@@ -319,20 +327,53 @@ EXPERIMENTS = {
     'sunetpp_fno': {'local_type': 'advanced_unet', 'spectral_type': 'sht', 'display': 'SU-Net++ FNO (Spherical + Advanced U-Net)'},
 }
 
-experiment_name = 'sunetpp_fno'   # ← 改這一行就能切換 4 個實驗！
-cfg = EXPERIMENTS[experiment_name]
+# === 主要旋鈕（這 4 個變數決定要跑哪個實驗）===
+base_experiment_name = 'sunetpp_fno'   # ← 從 EXPERIMENTS 挑一個架構
+SEED                 = 0               # ← 改成 1, 2 跑多 seed 驗證
+MODES                = 16              # ← FNO modes（搜尋時可改 24, 32）
+DROPOUT              = 0.0             # ← FNO dropout（搜尋時可改 0.1, 0.2）
+
+cfg = EXPERIMENTS[base_experiment_name]
+
+# 自動產生 experiment_name 後綴（預設值不會加後綴 → 保持與舊 baseline 同名）
+suffix_parts = []
+if SEED != 0:
+    suffix_parts.append(f's{SEED}')
+if MODES != 16:
+    suffix_parts.append(f'm{MODES}')
+if DROPOUT > 0:
+    suffix_parts.append(f'drop{int(round(DROPOUT*100))}')
+suffix = ('_' + '_'.join(suffix_parts)) if suffix_parts else ''
+experiment_name = base_experiment_name + suffix
 
 output_dir = os.path.join('outputs', experiment_name)
+
+# 防止意外覆蓋既有結果（如 outputs/sunetpp_fno/ 已是 PR 1+2 baseline）
+if os.path.exists(os.path.join(output_dir, 'training_log.csv')):
+    raise FileExistsError(
+        f"\n[防覆蓋保護] 輸出資料夾 {output_dir} 已存在完整訓練紀錄！\n"
+        f"如需重跑請先：\n"
+        f"  1. 改 SEED / DROPOUT / MODES 變數產生新後綴，或\n"
+        f"  2. 手動刪除 {output_dir} 整個資料夾"
+    )
+
 os.makedirs(output_dir, exist_ok=True)
+
+# 設定 random seed（涵蓋 torch / numpy / cuda）
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
 print(f"========================================")
 print(f" 實驗：{experiment_name}  →  {cfg['display']}")
 print(f" 輸出資料夾：{output_dir}")
+print(f" SEED={SEED} | MODES={MODES} | DROPOUT={DROPOUT}")
 print(f"========================================")
 
 ################################################################
 # 讀取 ERA5 氣象資料與設定
 ################################################################
-modes           = 16
+modes           = MODES   # 沿用 PR 3 旋鈕
 width           = 32
 batch_size      = 4
 epochs          = 50
@@ -388,7 +429,8 @@ test_loader  = torch.utils.data.DataLoader(test_dataset,  batch_size=batch_size,
 ################################################################
 model = FNO2d(modes, modes, width,
               local_type=cfg['local_type'],
-              spectral_type=cfg['spectral_type']).cuda()
+              spectral_type=cfg['spectral_type'],
+              dropout=DROPOUT).cuda()
 print(f"模型總參數數量: {count_params(model)}")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -408,25 +450,28 @@ print(f"========================================")
 
 # --- 把超參數快照寫進 config.json（之後可 reproduce） ---
 config_snapshot = {
-    'experiment_name': experiment_name,
-    'display_name':    cfg['display'],
-    'local_type':      cfg['local_type'],
-    'spectral_type':   cfg['spectral_type'],
-    'modes':           modes,
-    'width':           width,
-    'batch_size':      batch_size,
-    'epochs':          epochs,
-    'rollout_steps':   rollout_steps,
-    'TBPTT_K':         TBPTT_K,
-    'step_loss_gamma': step_loss_gamma,
-    'lr':              lr,
-    'weight_decay':    weight_decay,
-    'clip_norm':       clip_norm,
-    'train_size':      train_size,
-    'total_size':      total_size,
-    'param_count':     count_params(model),
-    'optimizer':       'Adam',
-    'scheduler':       'CosineAnnealingLR',
+    'experiment_name':      experiment_name,
+    'base_experiment_name': base_experiment_name,   # PR 3：multi-seed 分組用
+    'display_name':         cfg['display'],
+    'local_type':           cfg['local_type'],
+    'spectral_type':        cfg['spectral_type'],
+    'seed':                 SEED,                   # PR 3 旋鈕
+    'modes':                modes,
+    'dropout':              DROPOUT,                # PR 3 旋鈕
+    'width':                width,
+    'batch_size':           batch_size,
+    'epochs':               epochs,
+    'rollout_steps':        rollout_steps,
+    'TBPTT_K':              TBPTT_K,
+    'step_loss_gamma':      step_loss_gamma,
+    'lr':                   lr,
+    'weight_decay':         weight_decay,
+    'clip_norm':            clip_norm,
+    'train_size':           train_size,
+    'total_size':           total_size,
+    'param_count':          count_params(model),
+    'optimizer':            'Adam',
+    'scheduler':            'CosineAnnealingLR',
 }
 config_path = os.path.join(output_dir, 'config.json')
 with open(config_path, 'w', encoding='utf-8') as f:
@@ -445,6 +490,8 @@ step_weights = torch.tensor(
 
 history_train_mse = []
 history_test_mse  = []
+best_test_mse     = float('inf')   # PR 3：追蹤最佳 epoch
+best_epoch        = -1
 
 for ep in range(epochs):
     model.train()
@@ -506,7 +553,16 @@ for ep in range(epochs):
     test_mse  /= (len(test_loader) * rollout_steps)
     t2         = default_timer()
     epoch_time = t2 - t1
-    print(f"Epoch {ep:02d} | 耗時: {epoch_time:.1f}s | LR: {current_lr:.2e} | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}")
+
+    # PR 3：追蹤並保存「best test_mse 的權重」（讓後續 ablation 用乾淨的 best snapshot）
+    is_best = test_mse < best_test_mse
+    if is_best:
+        best_test_mse = test_mse
+        best_epoch    = ep
+        torch.save(model.state_dict(), os.path.join(output_dir, 'model_weights_best.pt'))
+
+    marker = "  ← new best" if is_best else ""
+    print(f"Epoch {ep:02d} | 耗時: {epoch_time:.1f}s | LR: {current_lr:.2e} | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}{marker}")
 
     history_train_mse.append(train_mse)
     history_test_mse.append(test_mse)
@@ -515,10 +571,19 @@ for ep in range(epochs):
     with open(csv_path, 'a', newline='', encoding='utf-8') as f:
         csv.writer(f).writerow([ep, train_mse, test_mse, current_lr, epoch_time])
 
-# --- 訓練結束後儲存模型權重 ---
+# --- 訓練結束後儲存最終模型權重（與 best 並存） ---
 weights_path = os.path.join(output_dir, 'model_weights.pt')
 torch.save(model.state_dict(), weights_path)
-print(f"模型權重已儲存：{weights_path}")
+print(f"\n最終模型權重已儲存：{weights_path}")
+print(f"最佳模型權重（epoch {best_epoch}, test_mse={best_test_mse:.4f}）："
+      f"{os.path.join(output_dir, 'model_weights_best.pt')}")
+
+# 把 best epoch 資訊補進 config.json
+config_snapshot['best_epoch']        = best_epoch
+config_snapshot['best_test_mse']     = best_test_mse
+config_snapshot['final_test_mse']    = history_test_mse[-1]
+with open(config_path, 'w', encoding='utf-8') as f:
+    json.dump(config_snapshot, f, indent=2, ensure_ascii=False)
 
 # --- 學習曲線 ---
 plt.figure(figsize=(10, 6))

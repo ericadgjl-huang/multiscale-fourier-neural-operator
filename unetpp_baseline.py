@@ -28,6 +28,7 @@ plt.rcParams['axes.unicode_minus'] = False
 from timeit import default_timer
 from utilities3 import *
 
+# Seeds 在實驗設定區段依 SEED 變數重設（覆蓋此預設）
 torch.manual_seed(0)
 np.random.seed(0)
 
@@ -157,16 +158,33 @@ class ERA5RolloutDataset(torch.utils.data.Dataset):
 
 
 ################################################################
-# 實驗設定
+# 實驗設定（PR 3：multi-seed 旋鈕）
 ################################################################
-experiment_name = 'unetpp_2d'
-display_name    = 'Pure UNet++ 2D (Nested CNN Baseline + lon circular pad)'
+base_experiment_name = 'unetpp_2d'
+display_name         = 'Pure UNet++ 2D (Nested CNN Baseline + lon circular pad)'
+SEED                 = 0   # ← 改成 1, 2 跑多 seed 驗證
 
-output_dir = os.path.join('outputs', experiment_name)
+# 自動後綴：SEED=0 不加後綴 → 與既有 outputs/unetpp_2d/ 同名
+suffix          = f'_s{SEED}' if SEED != 0 else ''
+experiment_name = base_experiment_name + suffix
+output_dir      = os.path.join('outputs', experiment_name)
+
+# 防止意外覆蓋既有結果
+if os.path.exists(os.path.join(output_dir, 'training_log.csv')):
+    raise FileExistsError(
+        f"\n[防覆蓋保護] {output_dir} 已有完整訓練紀錄！\n"
+        f"如需重跑請改 SEED 或手動刪除該資料夾。"
+    )
+
 os.makedirs(output_dir, exist_ok=True)
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
 print(f"========================================")
 print(f" 實驗：{experiment_name}  →  {display_name}")
 print(f" 輸出資料夾：{output_dir}")
+print(f" SEED={SEED}")
 print(f"========================================")
 
 base_width      = 32
@@ -239,26 +257,29 @@ print(f" 模型總參數：{count_params(model)}")
 print(f"========================================")
 
 config_snapshot = {
-    'experiment_name': experiment_name,
-    'display_name':    display_name,
-    'arch_family':     'pure_cnn_nested',
-    'base_width':      base_width,
-    'lon_pad':         lon_pad,
-    'batch_size':      batch_size,
-    'epochs':          epochs,
-    'rollout_steps':   rollout_steps,
-    'TBPTT_K':         TBPTT_K,
-    'step_loss_gamma': step_loss_gamma,
-    'lr':              lr,
-    'weight_decay':    weight_decay,
-    'clip_norm':       clip_norm,
-    'train_size':      train_size,
-    'total_size':      total_size,
-    'param_count':     count_params(model),
-    'optimizer':       'Adam',
-    'scheduler':       'CosineAnnealingLR',
+    'experiment_name':      experiment_name,
+    'base_experiment_name': base_experiment_name,   # PR 3：multi-seed 分組用
+    'display_name':         display_name,
+    'arch_family':          'pure_cnn_nested',
+    'seed':                 SEED,                   # PR 3 旋鈕
+    'base_width':           base_width,
+    'lon_pad':              lon_pad,
+    'batch_size':           batch_size,
+    'epochs':               epochs,
+    'rollout_steps':        rollout_steps,
+    'TBPTT_K':              TBPTT_K,
+    'step_loss_gamma':      step_loss_gamma,
+    'lr':                   lr,
+    'weight_decay':         weight_decay,
+    'clip_norm':            clip_norm,
+    'train_size':           train_size,
+    'total_size':           total_size,
+    'param_count':          count_params(model),
+    'optimizer':            'Adam',
+    'scheduler':            'CosineAnnealingLR',
 }
-with open(os.path.join(output_dir, 'config.json'), 'w', encoding='utf-8') as f:
+config_path = os.path.join(output_dir, 'config.json')
+with open(config_path, 'w', encoding='utf-8') as f:
     json.dump(config_snapshot, f, indent=2, ensure_ascii=False)
 
 csv_path = os.path.join(output_dir, 'training_log.csv')
@@ -271,6 +292,8 @@ step_weights = torch.tensor(
 
 history_train_mse = []
 history_test_mse  = []
+best_test_mse     = float('inf')   # PR 3：追蹤最佳 epoch
+best_epoch        = -1
 
 for ep in range(epochs):
     model.train()
@@ -326,7 +349,16 @@ for ep in range(epochs):
     test_mse  /= (len(test_loader) * rollout_steps)
     t2         = default_timer()
     epoch_time = t2 - t1
-    print(f"Epoch {ep:02d} | 耗時: {epoch_time:.1f}s | LR: {current_lr:.2e} | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}")
+
+    # PR 3：追蹤並保存「best test_mse 的權重」
+    is_best = test_mse < best_test_mse
+    if is_best:
+        best_test_mse = test_mse
+        best_epoch    = ep
+        torch.save(model.state_dict(), os.path.join(output_dir, 'model_weights_best.pt'))
+
+    marker = "  ← new best" if is_best else ""
+    print(f"Epoch {ep:02d} | 耗時: {epoch_time:.1f}s | LR: {current_lr:.2e} | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}{marker}")
 
     history_train_mse.append(train_mse)
     history_test_mse.append(test_mse)
@@ -335,7 +367,16 @@ for ep in range(epochs):
         csv.writer(f).writerow([ep, train_mse, test_mse, current_lr, epoch_time])
 
 torch.save(model.state_dict(), os.path.join(output_dir, 'model_weights.pt'))
-print(f"模型權重已儲存：{os.path.join(output_dir, 'model_weights.pt')}")
+print(f"\n最終模型權重已儲存：{os.path.join(output_dir, 'model_weights.pt')}")
+print(f"最佳模型權重（epoch {best_epoch}, test_mse={best_test_mse:.4f}）："
+      f"{os.path.join(output_dir, 'model_weights_best.pt')}")
+
+# 把 best epoch 資訊補進 config.json
+config_snapshot['best_epoch']     = best_epoch
+config_snapshot['best_test_mse']  = best_test_mse
+config_snapshot['final_test_mse'] = history_test_mse[-1]
+with open(config_path, 'w', encoding='utf-8') as f:
+    json.dump(config_snapshot, f, indent=2, ensure_ascii=False)
 
 ################################################################
 # 視覺化（與 fourier_2d.py / unet_baseline.py 相同的 4 張圖）
