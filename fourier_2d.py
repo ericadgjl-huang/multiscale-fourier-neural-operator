@@ -197,6 +197,76 @@ class ConvNeXtBlock2d(nn.Module):
         x = self.pwconv2(x)
         return x + res
 
+################################################################
+# Transformer building blocks（PR 5：sutrans_fno 用）
+# 從 transunet_baseline.py 複製，避免 import 引發 transunet 整個訓練腳本執行
+################################################################
+class TransformerBottleneck(nn.Module):
+    """
+    把 (B, C, H, W) flatten 成 (B, H*W, C) tokens 餵給 transformer，
+    再 reshape 回 (B, C, H, W)。pre-norm（norm_first=True）提升訓練穩定度。
+    """
+    def __init__(self, channels, max_tokens, n_layers=4, n_heads=4, ffn_mult=4, dropout=0.0):
+        super().__init__()
+        self.channels   = channels
+        self.max_tokens = max_tokens
+
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_tokens, channels))
+        nn.init.trunc_normal_(self.pos_emb, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model         = channels,
+            nhead           = n_heads,
+            dim_feedforward = channels * ffn_mult,
+            dropout         = dropout,
+            activation      = 'gelu',
+            batch_first     = True,
+            norm_first      = True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.norm_out    = nn.LayerNorm(channels)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        n_tokens   = H * W
+        assert n_tokens <= self.max_tokens, \
+            f"序列長度 {n_tokens} 超過位置編碼上限 {self.max_tokens}"
+
+        x = x.flatten(2).transpose(1, 2)
+        x = x + self.pos_emb[:, :n_tokens, :]
+        x = self.transformer(x)
+        x = self.norm_out(x)
+        x = x.transpose(1, 2).reshape(B, C, H, W)
+        return x
+
+
+class TransformerLocalBlock(nn.Module):
+    """
+    FNO local path 的 transformer 版本：
+    1. Down-sample 4× (stride-4 conv)：33×64 → 9×16 (144 tokens)
+    2. Transformer self-attention at low resolution（attention 矩陣只有 144²）
+    3. Bilinear upsample 回到原解析度
+    記憶體量級與 TransUNet bottleneck 相同。
+    """
+    def __init__(self, width, n_layers=2, n_heads=4, dropout=0.0):
+        super().__init__()
+        self.down = nn.Conv2d(width, width, kernel_size=3, stride=4, padding=1)
+        self.transformer = TransformerBottleneck(
+            channels   = width,
+            max_tokens = 200,
+            n_layers   = n_layers,
+            n_heads    = n_heads,
+            dropout    = dropout,
+        )
+
+    def forward(self, x):
+        H_in, W_in = x.shape[2], x.shape[3]
+        z = self.down(x)
+        z = self.transformer(z)
+        z = F.interpolate(z, size=(H_in, W_in), mode='bilinear', align_corners=True)
+        return z
+
+
 class FNO2d(nn.Module):
     def __init__(self, modes1, modes2, width, local_type='1x1', spectral_type='sht', dropout=0.0):
         super(FNO2d, self).__init__()
@@ -250,6 +320,9 @@ class FNO2d(nn.Module):
             return AdvancedUNetBlock2d(self.width)
         elif self.local_type == 'convnext':
             return ConvNeXtBlock2d(self.width)
+        elif self.local_type == 'transformer':
+            return TransformerLocalBlock(self.width, n_layers=2, n_heads=4,
+                                          dropout=self.dropout_p)
         elif self.local_type == 'none':
             return None
 
@@ -325,10 +398,11 @@ EXPERIMENTS = {
     'sfno':        {'local_type': '1x1',           'spectral_type': 'sht', 'display': 'SFNO (Spherical Baseline)'},
     'sufno':       {'local_type': 'unet',          'spectral_type': 'sht', 'display': 'SUFNO (Spherical + U-Net)'},
     'sunetpp_fno': {'local_type': 'advanced_unet', 'spectral_type': 'sht', 'display': 'SU-Net++ FNO (Spherical + Advanced U-Net)'},
+    'sutrans_fno': {'local_type': 'transformer',   'spectral_type': 'sht', 'display': 'SU-Trans FNO (Spherical + Transformer local)'},
 }
 
 # === 主要旋鈕（這 4 個變數決定要跑哪個實驗）===
-base_experiment_name = 'sunetpp_fno'   # ← 從 EXPERIMENTS 挑一個架構
+base_experiment_name = 'sutrans_fno'   # ← 從 EXPERIMENTS 挑一個架構
 SEED                 = 0               # ← 改成 1, 2 跑多 seed 驗證
 MODES                = 16              # ← FNO modes（搜尋時可改 24, 32）
 DROPOUT              = 0.0             # ← FNO dropout（搜尋時可改 0.1, 0.2）
