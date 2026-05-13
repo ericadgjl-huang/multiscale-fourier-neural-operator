@@ -162,7 +162,7 @@ class ERA5RolloutDataset(torch.utils.data.Dataset):
 ################################################################
 base_experiment_name = 'unetpp_2d'
 display_name         = 'Pure UNet++ 2D (Nested CNN Baseline + lon circular pad)'
-SEED                 = 0   # ← 改成 1, 2 跑多 seed 驗證
+SEED                 = 2   # ← 改成 1, 2 跑多 seed 驗證
 
 # 自動後綴：SEED=0 不加後綴 → 與既有 outputs/unetpp_2d/ 同名
 suffix          = f'_s{SEED}' if SEED != 0 else ''

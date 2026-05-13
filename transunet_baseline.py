@@ -224,7 +224,7 @@ class ERA5RolloutDataset(torch.utils.data.Dataset):
 ################################################################
 base_experiment_name = 'transunet_2d'
 display_name         = 'TransUNet 2D (CNN encoder + Transformer bottleneck + CNN decoder)'
-SEED                 = 0   # ← 改成 1, 2 跑多 seed 驗證
+SEED                 = 2   # ← 改成 1, 2 跑多 seed 驗證
 
 suffix          = f'_s{SEED}' if SEED != 0 else ''
 experiment_name = base_experiment_name + suffix
