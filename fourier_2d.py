@@ -461,6 +461,10 @@ clip_norm       = 1.0
 print("正在讀取 ERA5 氣象資料...")
 ds = xr.open_mfdataset('data/global_era5_mini_*.nc', engine='h5netcdf', combine='by_coords')
 
+lons = ds['longitude'].values
+lats = ds['latitude'].values
+geo_extent = [float(lons.min()), float(lons.max()), float(lats.min()), float(lats.max())]
+
 t2m = torch.tensor(ds['t2m'].values)
 msl = torch.tensor(ds['msl'].values)
 u10 = torch.tensor(ds['u10'].values)
@@ -754,9 +758,21 @@ for row, (ts, label) in enumerate(zip(target_steps, target_labels)):
     pred = all_preds[ts][idx, :, :, 0].cpu().numpy()   # 溫度通道預測
     err  = gt - pred
 
-    im0 = axes[row, 0].imshow(gt,   cmap='jet');      axes[row, 0].set_title(f'True {label}');   fig.colorbar(im0, ax=axes[row, 0])
-    im1 = axes[row, 1].imshow(pred, cmap='jet');      axes[row, 1].set_title(f'Pred {label}');   fig.colorbar(im1, ax=axes[row, 1])
-    im2 = axes[row, 2].imshow(err,  cmap='coolwarm'); axes[row, 2].set_title(f'Error {label}');  fig.colorbar(im2, ax=axes[row, 2])
+    im0 = axes[row, 0].imshow(gt, cmap='jet', extent=geo_extent, aspect='auto')
+    axes[row, 0].set_title(f'True {label}')
+    axes[row, 0].set_ylabel('Latitude')
+    fig.colorbar(im0, ax=axes[row, 0])
+
+    im1 = axes[row, 1].imshow(pred, cmap='jet', extent=geo_extent, aspect='auto')
+    axes[row, 1].set_title(f'Pred {label}')
+    fig.colorbar(im1, ax=axes[row, 1])
+
+    im2 = axes[row, 2].imshow(err, cmap='coolwarm', extent=geo_extent, aspect='auto')
+    axes[row, 2].set_title(f'Error {label}')
+    fig.colorbar(im2, ax=axes[row, 2])
+
+for ax in axes[-1, :]:
+    ax.set_xlabel('Longitude')
 
 plt.suptitle(f'Temperature Prediction Error Maps — {model_name}', fontsize=14, fontweight='bold')
 plt.tight_layout()
