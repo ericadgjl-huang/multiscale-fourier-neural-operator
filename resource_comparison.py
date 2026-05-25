@@ -150,16 +150,23 @@ def build_model_for_group(group, cfg):
     根據 group 名稱回傳對應的 model instance（已 to('cuda')）。
     若無法建立則回傳 None。
     """
+    # Hardcoded FNO EXPERIMENTS dict (cutoff 截在 ERA5RolloutDataset 之前，所以 EXPERIMENTS 還沒被定義)
+    FNO_EXP = {
+        '2d_fno':      {'local_type': '1x1',           'spectral_type': 'fft'},
+        'sfno':        {'local_type': '1x1',           'spectral_type': 'sht'},
+        'sufno':       {'local_type': 'unet',          'spectral_type': 'sht'},
+        'sunetpp_fno': {'local_type': 'advanced_unet', 'spectral_type': 'sht'},
+        'sutrans_fno': {'local_type': 'transformer',   'spectral_type': 'sht'},
+    }
     try:
-        if group in ['2d_fno', 'sfno', 'sufno', 'sunetpp_fno', 'sutrans_fno']:
+        if group in FNO_EXP:
             # FNO2d 從 fourier_2d.py 載入 — 截斷在 ERA5RolloutDataset 之前
             src = open('fourier_2d.py', encoding='utf-8').read()
             cutoff = src.find('################################################################\n# ERA5RolloutDataset')
             ns = {}
             exec(compile(src[:cutoff], 'fourier_2d.py', 'exec'), ns)
             FNO2d = ns['FNO2d']
-            EXPERIMENTS = ns['EXPERIMENTS']
-            ec = EXPERIMENTS[group]
+            ec = FNO_EXP[group]
             return FNO2d(16, 16, 32, local_type=ec['local_type'],
                          spectral_type=ec['spectral_type'], dropout=0.0).cuda()
         elif group == 'unet_2d':

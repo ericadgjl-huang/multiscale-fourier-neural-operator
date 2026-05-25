@@ -87,17 +87,29 @@ test_y = torch.stack(test_y_list, dim=1)   # (B, rollout, 33, 64, 8)
 
 
 ################################################################
+# Hardcoded EXPERIMENTS（從 fourier_2d.py 複製，避免 exec cutoff 問題）
+################################################################
+FNO_EXPERIMENTS = {
+    '2d_fno':      {'local_type': '1x1',           'spectral_type': 'fft'},
+    'sfno':        {'local_type': '1x1',           'spectral_type': 'sht'},
+    'sufno':       {'local_type': 'unet',          'spectral_type': 'sht'},
+    'sunetpp_fno': {'local_type': 'advanced_unet', 'spectral_type': 'sht'},
+    'sutrans_fno': {'local_type': 'transformer',   'spectral_type': 'sht'},
+}
+
+
+################################################################
 # 2. Model factory（按 group 名稱建立對應的模型 class）
 ################################################################
 def build_model_for_group(group):
     """從各個 baseline script 載入 model class，避免觸發訓練。"""
     try:
-        if group in ['2d_fno', 'sfno', 'sufno', 'sunetpp_fno', 'sutrans_fno']:
+        if group in FNO_EXPERIMENTS:
             src = open('fourier_2d.py', encoding='utf-8').read()
             cutoff = src.find('################################################################\n# ERA5RolloutDataset')
             ns = {}
             exec(compile(src[:cutoff], 'fourier_2d.py', 'exec'), ns)
-            ec = ns['EXPERIMENTS'][group]
+            ec = FNO_EXPERIMENTS[group]
             return ns['FNO2d'](16, 16, 32,
                                 local_type=ec['local_type'],
                                 spectral_type=ec['spectral_type'],
@@ -337,7 +349,7 @@ for j, group in enumerate([g for g in REP_ARCHS if g in preds_day10]):
 
 # 第二列：誤差（True - Pred）
 axes[1, 0].axis('off')
-axes[1, 0].text(0.5, 0.5, 'Errors\n(Ground Truth − Pred)', ha='center', va='center',
+axes[1, 0].text(0.5, 0.5, 'Errors\n(Ground Truth - Pred)', ha='center', va='center',
                  fontsize=12, fontweight='bold', transform=axes[1, 0].transAxes)
 for j, group in enumerate([g for g in REP_ARCHS if g in preds_day10]):
     err = gt_day10 - preds_day10[group]
