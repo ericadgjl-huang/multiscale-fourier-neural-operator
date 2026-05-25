@@ -66,24 +66,52 @@ for e in experiments:
     print(f"  - {e['arch']:20s}  ({e['param_count']/1e6:.2f}M params, {len(e['df'])} epochs)")
 
 ################################################################
-# 2. 圖 1：學習曲線同框（左 train / 右 test，log scale 易看差異）
+# 類別判定（給 bar chart 用顏色分群）
 ################################################################
-fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+def _categorize(name):
+    if name in ['unet_2d', 'unetpp_2d', 'transunet_2d', '2d_fno'] \
+       or name.startswith('unet_2d_') or name.startswith('unetpp_2d_') \
+       or name.startswith('transunet_2d_'):
+        return 'planar'
+    if name.startswith('sphere_'):
+        return 'pure_sphere'
+    return 'fno_hybrid'
+
+CAT_COLOR = {'planar': '#2ecc71', 'fno_hybrid': '#f39c12', 'pure_sphere': '#e74c3c'}
+CAT_LABEL = {
+    'planar':      'Pure 2D (lon pad)',
+    'fno_hybrid':  'FNO Hybrid (SHT + planar)',
+    'pure_sphere': 'Pure Spherical (SHT-only)',
+}
+
+################################################################
+# 2. 圖 1：學習曲線同框（按類別分色，log scale）
+################################################################
+# 同類別用同色，但加 alpha 區分多 seed 個體
+import collections
+cat_count = collections.Counter(_categorize(e['arch']) for e in experiments)
+cat_seen  = collections.Counter()
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 7))
 for exp in experiments:
+    cat = _categorize(exp['arch'])
+    cat_seen[cat] += 1
+    alpha = 0.4 + 0.6 * (cat_seen[cat] / cat_count[cat])  # 同類內漸層
+    color = CAT_COLOR[cat]
     df = exp['df']
     label = f"{exp['arch']} ({exp['param_count']/1e6:.2f}M)"
-    axes[0].plot(df['epoch'], df['train_mse'], label=label, linewidth=2)
-    axes[1].plot(df['epoch'], df['test_mse'],  label=label, linewidth=2)
+    axes[0].plot(df['epoch'], df['train_mse'], label=label, linewidth=1.8, color=color, alpha=alpha)
+    axes[1].plot(df['epoch'], df['test_mse'],  label=label, linewidth=1.8, color=color, alpha=alpha)
 
 for ax, title in zip(axes, ['Train MSE', 'Test MSE']):
     ax.set_xlabel('Epoch', fontsize=12)
     ax.set_ylabel('MSE',   fontsize=12)
     ax.set_title(title,    fontsize=14)
-    ax.legend(fontsize=10)
+    ax.legend(fontsize=7, ncol=2, loc='upper right')   # 縮小字、雙欄
     ax.grid(True, alpha=0.4)
-    ax.set_yscale('log')   # log scale → 看得到收斂尾段差異
+    ax.set_yscale('log')
 
-plt.suptitle('Architecture Comparison — Learning Curves', fontsize=15, fontweight='bold')
+plt.suptitle('Architecture Comparison — Learning Curves (colored by category)', fontsize=15, fontweight='bold')
 plt.tight_layout()
 out_path = os.path.join(COMPARE_DIR, 'comparison_learning_curves.png')
 plt.savefig(out_path, dpi=300, bbox_inches='tight')
@@ -92,32 +120,47 @@ print(f"[輸出] {out_path}")
 
 ################################################################
 # 3. 圖 2：最終 metrics bar chart（左 final test MSE / 右 參數量）
+#         加大圖寬、按 final test MSE 排序、類別著色
 ################################################################
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-arch_names     = [e['arch'] for e in experiments]
-final_test_mse = [e['df']['test_mse'].iloc[-1]  for e in experiments]
-param_counts_M = [e['param_count'] / 1e6        for e in experiments]
-colors         = plt.cm.tab10(np.arange(len(experiments)))
+# 按 final test MSE 升序排
+sorted_exps = sorted(experiments, key=lambda e: e['df']['test_mse'].iloc[-1])
+arch_names     = [e['arch'] for e in sorted_exps]
+final_test_mse = [e['df']['test_mse'].iloc[-1]  for e in sorted_exps]
+param_counts_M = [e['param_count'] / 1e6        for e in sorted_exps]
+colors         = [CAT_COLOR[_categorize(n)] for n in arch_names]
 
-bars1 = axes[0].bar(arch_names, final_test_mse, color=colors)
-axes[0].set_ylabel('Final Test MSE', fontsize=12)
-axes[0].set_title('Final Test MSE',  fontsize=14)
-axes[0].grid(True, alpha=0.4, axis='y')
-axes[0].tick_params(axis='x', rotation=20)
+fig, axes = plt.subplots(1, 2, figsize=(22, 7))   # 從 14×5 加大到 22×7
+
+bars1 = axes[0].bar(arch_names, final_test_mse, color=colors, edgecolor='black', linewidth=0.5, alpha=0.9)
+axes[0].set_ylabel('Final Test MSE', fontsize=12, fontweight='bold')
+axes[0].set_title('Final Test MSE (sorted ascending)',  fontsize=14, fontweight='bold')
+axes[0].grid(True, alpha=0.4, axis='y', linestyle='--')
+axes[0].tick_params(axis='x', rotation=45, labelsize=8)
+for tick in axes[0].get_xticklabels():
+    tick.set_ha('right')
 for bar, val in zip(bars1, final_test_mse):
     axes[0].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
-                 f'{val:.4f}', ha='center', va='bottom', fontsize=9)
+                 f'{val:.4f}', ha='center', va='bottom', fontsize=8, rotation=90)
 
-bars2 = axes[1].bar(arch_names, param_counts_M, color=colors)
-axes[1].set_ylabel('Parameters (M)', fontsize=12)
-axes[1].set_title('Model Size',      fontsize=14)
-axes[1].grid(True, alpha=0.4, axis='y')
-axes[1].tick_params(axis='x', rotation=20)
+bars2 = axes[1].bar(arch_names, param_counts_M, color=colors, edgecolor='black', linewidth=0.5, alpha=0.9)
+axes[1].set_ylabel('Parameters (M)', fontsize=12, fontweight='bold')
+axes[1].set_title('Model Size',      fontsize=14, fontweight='bold')
+axes[1].grid(True, alpha=0.4, axis='y', linestyle='--')
+axes[1].tick_params(axis='x', rotation=45, labelsize=8)
+for tick in axes[1].get_xticklabels():
+    tick.set_ha('right')
 for bar, val in zip(bars2, param_counts_M):
     axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height(),
                  f'{val:.2f}M', ha='center', va='bottom', fontsize=9)
 
-plt.suptitle('Architecture Comparison — Final Metrics', fontsize=15, fontweight='bold')
+# 加類別圖例（同一張圖只需一份）
+from matplotlib.patches import Patch
+legend_handles = [Patch(facecolor=CAT_COLOR[c], edgecolor='black', label=CAT_LABEL[c])
+                  for c in ['planar', 'fno_hybrid', 'pure_sphere']]
+axes[0].legend(handles=legend_handles, loc='upper left', fontsize=10, framealpha=0.95)
+
+plt.suptitle('Architecture Comparison — Final Metrics (sorted by Test MSE)',
+             fontsize=15, fontweight='bold')
 plt.tight_layout()
 out_path = os.path.join(COMPARE_DIR, 'comparison_final_metrics.png')
 plt.savefig(out_path, dpi=300, bbox_inches='tight')
