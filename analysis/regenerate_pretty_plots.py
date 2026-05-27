@@ -8,10 +8,17 @@ regenerate_pretty_plots.py
 3. 對固定的 test batch 跑 40 步 rollout 推論
 4. 重新產出 weather_prediction_pretty.png：與原圖一樣但加上 Longitude/Latitude 軸標籤
 
+用法：python analysis/regenerate_pretty_plots.py（從專案根目錄執行）
+
 輸出位置：
     outputs/<arch>/weather_prediction_pretty.png  ← 每個架構各一張
+    outputs/_comparison/cross_arch_day10_comparison.png  ← 跨架構對比圖
 """
-import os
+import os, sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+
 import json
 import glob
 

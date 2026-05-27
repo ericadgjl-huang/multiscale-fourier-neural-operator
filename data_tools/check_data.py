@@ -1,7 +1,13 @@
+"""check_data.py — 簡單的 NetCDF 結構檢查工具。
+用法：python data_tools/check_data.py（從專案根目錄執行）"""
+import os, sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+
 import xarray as xr
 
-# 1. 讀取你剛剛改名並放進 data 資料夾的氣象檔
-# (如果你沒有改名，請把這裡替換成你原本的亂碼檔名)
+# 1. 讀取資料夾內的氣象檔
 file_path = "data/east_asia_era5_202301.nc"
 ds = xr.open_dataset(file_path, engine='h5netcdf')
 

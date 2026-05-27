@@ -4,8 +4,14 @@ final_ablation_plot.py
 1. final_ablation_heatmap.png  — 架構×幾何 的 heatmap（報告封面圖）
 2. final_ablation_bars.png     — 所有實驗排序 bar chart（含 std）
 3. final_ablation_table.csv    — 3×3 表格匯出
+
+用法：python analysis/final_ablation_plot.py（從專案根目錄執行）
 """
-import os
+import os, sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+
 import re
 import json
 import glob

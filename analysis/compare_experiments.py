@@ -2,14 +2,19 @@
 compare_experiments.py
 自動掃描 outputs/ 下所有實驗，產出橫向比較圖表與摘要 CSV。
 
-用法：python compare_experiments.py
+用法：python analysis/compare_experiments.py（從專案根目錄執行）
 
 輸出：
     outputs/_comparison/comparison_learning_curves.png  ← 學習曲線同框
     outputs/_comparison/comparison_final_metrics.png    ← 最終 MSE / 參數量 bar chart
     outputs/_comparison/comparison_summary.csv          ← 報告數字總表
 """
-import os
+import os, sys
+# 不論從哪裡執行，都切到 project root 讓相對路徑（outputs/, data/）正常運作
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+
 import json
 import glob
 import numpy as np
@@ -85,33 +90,32 @@ CAT_LABEL = {
 }
 
 ################################################################
-# 2. 圖 1：學習曲線同框（按類別分色，log scale）
+# 2. 圖 1：學習曲線同框（每個實驗獨立顏色，用 tab20 取代 tab10）
 ################################################################
-# 同類別用同色，但加 alpha 區分多 seed 個體
-import collections
-cat_count = collections.Counter(_categorize(e['arch']) for e in experiments)
-cat_seen  = collections.Counter()
+fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+n_exp = len(experiments)
+# 用 tab20（20 色）；超過 20 個實驗時循環，但有 line style 區分
+colormap = plt.cm.tab20(np.linspace(0, 1, max(n_exp, 20)))
 
-fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-for exp in experiments:
-    cat = _categorize(exp['arch'])
-    cat_seen[cat] += 1
-    alpha = 0.4 + 0.6 * (cat_seen[cat] / cat_count[cat])  # 同類內漸層
-    color = CAT_COLOR[cat]
+for i, exp in enumerate(experiments):
     df = exp['df']
+    color = colormap[i % len(colormap)]
+    linestyle = '-' if i < 20 else '--'   # 超過 20 個換虛線
     label = f"{exp['arch']} ({exp['param_count']/1e6:.2f}M)"
-    axes[0].plot(df['epoch'], df['train_mse'], label=label, linewidth=1.8, color=color, alpha=alpha)
-    axes[1].plot(df['epoch'], df['test_mse'],  label=label, linewidth=1.8, color=color, alpha=alpha)
+    axes[0].plot(df['epoch'], df['train_mse'], label=label,
+                 linewidth=1.5, color=color, linestyle=linestyle)
+    axes[1].plot(df['epoch'], df['test_mse'],  label=label,
+                 linewidth=1.5, color=color, linestyle=linestyle)
 
 for ax, title in zip(axes, ['Train MSE', 'Test MSE']):
     ax.set_xlabel('Epoch', fontsize=12)
     ax.set_ylabel('MSE',   fontsize=12)
     ax.set_title(title,    fontsize=14)
-    ax.legend(fontsize=7, ncol=2, loc='upper right')   # 縮小字、雙欄
+    ax.legend(fontsize=7, ncol=2, loc='upper right', framealpha=0.85)
     ax.grid(True, alpha=0.4)
     ax.set_yscale('log')
 
-plt.suptitle('Architecture Comparison — Learning Curves (colored by category)', fontsize=15, fontweight='bold')
+plt.suptitle('Architecture Comparison — Learning Curves', fontsize=15, fontweight='bold')
 plt.tight_layout()
 out_path = os.path.join(COMPARE_DIR, 'comparison_learning_curves.png')
 plt.savefig(out_path, dpi=300, bbox_inches='tight')

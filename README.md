@@ -1,72 +1,140 @@
-# Fourier Neural Operator
+# Spherical Neural Operators vs Planar CNNs on Low-Resolution Weather Forecasting
 
-This repository contains the code for the paper:
-- [(FNO) Fourier Neural Operator for Parametric Partial Differential Equations](https://arxiv.org/abs/2010.08895)
+A systematic 3×3 ablation study comparing **architecture (UNet / UNet++ / TransUNet)** × **geometry handling (planar with longitude circular padding / FNO-hybrid / pure spherical SHT)** for 10-day rollout forecasting on mini-ERA5 (33×64 grid).
 
-In this work, we formulate a new neural operator by parameterizing the integral kernel directly in Fourier space, allowing for an expressive and efficient architecture. 
-We perform experiments on Burgers' equation, Darcy flow, and the Navier-Stokes equation (including the turbulent regime). 
-Our Fourier neural operator shows state-of-the-art performance compared to existing neural network methodologies and it is up to three orders of magnitude faster compared to traditional PDE solvers.
+**Key finding**: Pure planar CNNs with longitude circular padding statistically significantly **outperform** all spherical neural operator variants on low-resolution data. The "spherical is necessary" assumption inherited from large-scale weather DL papers does not hold at this scale.
 
-It follows from the previous works:
-- [(GKN) Neural Operator: Graph Kernel Network for Partial Differential Equations](https://arxiv.org/abs/2003.03485)
-- [(MGKN) Multipole Graph Neural Operator for Parametric Partial Differential Equations](https://arxiv.org/abs/2006.09535)
+## Result Summary (Best Test MSE)
 
+| Architecture | Pure 2D (lon pad) | FNO Hybrid (SHT ⊕ planar) | Pure Spherical (SHT-only) |
+|---|---|---|---|
+| **UNet**       | **0.3751 ± 0.0010** (n=3) | 0.3969 ± 0.0077 (n=3) | 0.4224 (n=1) |
+| **UNet++**     | 0.3803 ± 0.0044 (n=3)     | 0.3882 ± 0.0059 (n=3) | 0.4165 (n=1) |
+| **TransUNet**  | 0.3765 ± 0.0031 (n=3)     | 0.4228 ± 0.0077 (n=3) | 0.4151 (n=1) |
 
-## Requirements
-- We have updated the files to support [PyTorch 1.8.0](https://pytorch.org/). 
-Pytorch 1.8.0 starts to support complex numbers and it has a new implementation of FFT. 
-As a result the code is about 30% faster.
-- Previous version for [PyTorch 1.6.0](https://pytorch.org/) is avaiable at `FNO-torch.1.6`.
+→ **planar > FNO hybrid > pure spherical** holds consistently across all three architectures.
 
-## Files
-The code is in the form of simple scripts. Each script shall be stand-alone and directly runnable.
+---
 
-- `fourier_1d.py` is the Fourier Neural Operator for 1D problem such as the (time-independent) Burgers equation discussed in Section 5.1 in the [paper](https://arxiv.org/pdf/2010.08895.pdf).
-- `fourier_2d.py` is the Fourier Neural Operator for 2D problem such as the Darcy Flow discussed in Section 5.2 in the [paper](https://arxiv.org/pdf/2010.08895.pdf).
-- `fourier_2d_time.py` is the Fourier Neural Operator for 2D problem such as the Navier-Stokes equation discussed in Section 5.3 in the [paper](https://arxiv.org/pdf/2010.08895.pdf), 
-which uses a recurrent structure to propagates in time.
-- `fourier_3d.py` is the Fourier Neural Operator for 3D problem such as the Navier-Stokes equation discussed in Section 5.3 in the [paper](https://arxiv.org/pdf/2010.08895.pdf),
-which takes the 2D spatial + 1D temporal equation directly as a 3D problem
-- The lowrank methods are similar. These scripts are the Lowrank neural operators for the corresponding settings.
-- `data_generation` are the conventional solvers we used to generate the datasets for the Burgers equation, Darcy flow, and Navier-Stokes equation.
-
-## Datasets
-We provide the Burgers equation, Darcy flow, and Navier-Stokes equation datasets we used in the paper. 
-The data generation configuration can be found in the paper.
-- [PDE datasets](https://drive.google.com/drive/folders/1UnbQh2WWc6knEHbLn-ZaXrKUZhp7pjt-?usp=sharing)
-
-The datasets are given in the form of matlab file. They can be loaded with the scripts provided in utilities.py. 
-Each data file is loaded as a tensor. The first index is the samples; the rest of indices are the discretization.
-For example, 
-- `Burgers_R10.mat` contains the dataset for the Burgers equation. It is of the shape [1000, 8192], 
-meaning it has 1000 training samples on a grid of 8192.
-- `NavierStokes_V1e-3_N5000_T50.mat` contains the dataset for the 2D Navier-Stokes equation. It is of the shape [5000, 64, 64, 50], 
-meaning it has 5000 training samples on a grid of (64, 64) with 50 time steps.
-
-We also provide the data generation scripts at `data_generation`.
-
-## Models
-Here are the pre-trained models. It can be evaluated using _eval.py_ or _super_resolution.py_.
-- [models](https://drive.google.com/drive/folders/1swLA6yKR1f3PKdYSKhLqK4zfNjS9pt_U?usp=sharing)
-
-## Citations
+## Project Structure
 
 ```
-@misc{li2020fourier,
-      title={Fourier Neural Operator for Parametric Partial Differential Equations}, 
-      author={Zongyi Li and Nikola Kovachki and Kamyar Azizzadenesheli and Burigede Liu and Kaushik Bhattacharya and Andrew Stuart and Anima Anandkumar},
-      year={2020},
-      eprint={2010.08895},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG}
-}
-
-@misc{li2020neural,
-      title={Neural Operator: Graph Kernel Network for Partial Differential Equations}, 
-      author={Zongyi Li and Nikola Kovachki and Kamyar Azizzadenesheli and Burigede Liu and Kaushik Bhattacharya and Andrew Stuart and Anima Anandkumar},
-      year={2020},
-      eprint={2003.03485},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG}
-}
+fourier-neural-operator/
+├── README.md                          (this file)
+├── LICENSE                            (MIT)
+├── .gitignore
+│
+├── fourier_2d.py                      ← 5 FNO variants (2d_fno, sfno, sufno, sunetpp_fno, sutrans_fno)
+├── unet_baseline.py                   ← Pure 2D UNet
+├── unetpp_baseline.py                 ← Pure 2D UNet++
+├── transunet_baseline.py              ← Pure 2D TransUNet
+├── sphere_unet_baseline.py            ← Pure spherical UNet
+├── sphere_unetpp_baseline.py          ← Pure spherical UNet++
+├── sphere_transunet_baseline.py       ← Pure spherical TransUNet
+├── pca_net.py                         ← PCA+MLP traditional baseline
+│
+├── sphere_blocks.py                   ← Shared SHT building blocks
+├── utilities3.py                      ← Shared utilities (from upstream FNO repo)
+├── Adam.py                            ← Adam optimizer (from upstream)
+│
+├── analysis/                          ← Result analysis & visualization
+│   ├── compare_experiments.py             scan outputs/ → learning curves + bar chart
+│   ├── multi_seed_compare.py              group by (base, modes, dropout) → mean ± std
+│   ├── final_ablation_plot.py             3×3 heatmap (paper Figure 1)
+│   ├── resource_comparison.py             params / time / inference / memory (paper Table 2)
+│   └── regenerate_pretty_plots.py         re-render plots with geographic axes
+│
+├── data_tools/                        ← Data download & inspection
+│   ├── check_data.py                       inspect a single NetCDF
+│   ├── download_global.py                  download 2021-2023 mini-ERA5
+│   └── download_global_mini.py             download a single file
+│
+├── archive/                           ← Frozen v1 baseline scripts (Git history backup)
+│
+├── data/        (gitignored)          ← ERA5 NetCDF files go here
+└── outputs/     (gitignored)          ← Training results
+    ├── <arch>/                            per-experiment folder
+    │   ├── config.json                    hyperparameter snapshot
+    │   ├── training_log.csv               per-epoch metrics
+    │   ├── model_weights.pt               final weights
+    │   ├── model_weights_best.pt          best test_mse weights
+    │   └── *.png                          4 visualization plots
+    └── _comparison/                       analysis script outputs
+        ├── final_ablation_heatmap.png     ★ Paper Figure 1
+        ├── multi_seed_plot.png            multi-seed bars
+        ├── resource_comparison.png        Table 2 visualization
+        └── *.csv                          summary tables
 ```
+
+---
+
+## Quick Start
+
+### 1. Setup environment
+Requires Python 3.10+ with PyTorch, `torch_harmonics`, `xarray`, `h5netcdf`, `pandas`, `matplotlib`.
+
+```bash
+pip install torch torchvision torch_harmonics xarray h5netcdf pandas matplotlib
+```
+
+### 2. Download ERA5 mini data
+Configure `~/.cdsapirc` with CDS credentials, then:
+
+```bash
+python data_tools/download_global.py
+```
+
+Files land in `data/global_era5_mini_*.nc`.
+
+### 3. Train one architecture
+Edit the top of any training script to choose the experiment, then run:
+
+```bash
+# FNO family — set base_experiment_name to one of:
+# '2d_fno' / 'sfno' / 'sufno' / 'sunetpp_fno' / 'sutrans_fno'
+python fourier_2d.py
+
+# Or any pure-CNN baseline
+python unet_baseline.py
+python unetpp_baseline.py
+python transunet_baseline.py
+
+# Or pure-spherical UNet variants
+python sphere_unet_baseline.py
+python sphere_unetpp_baseline.py
+python sphere_transunet_baseline.py
+```
+
+Each script writes to `outputs/<experiment_name>/`. The overwrite-protection check will raise an error if the folder already has training results — change `SEED`, `MODES`, or `DROPOUT` to get a new folder name.
+
+### 4. Analyze results
+
+```bash
+python analysis/compare_experiments.py     # per-experiment view
+python analysis/multi_seed_compare.py      # grouped multi-seed statistics
+python analysis/final_ablation_plot.py     # 3×3 heatmap + bars
+python analysis/resource_comparison.py     # params / time / memory / latency
+python analysis/regenerate_pretty_plots.py # re-render plots with lat/lon axes
+```
+
+All analysis scripts auto-`chdir` to project root, so they work from anywhere.
+
+---
+
+## Experimental Setup
+
+- **Dataset**: ERA5 mini, 2021-2023, 33×64 (~5.45° lat × 5.625° lon), 6-hourly
+- **Variables**: 2m temperature, sea-level pressure, 10m U/V wind
+- **Time embedding**: sin/cos of day-of-year and hour-of-day (4 extra input channels)
+- **Train / Test split**: 2920 timesteps train (2021-2022) / remainder test (2023)
+- **Task**: 10-day rollout forecasting (40 autoregressive steps, 6 h each)
+- **Loss**: step-decay-weighted MSE (γ=0.95) with Truncated BPTT (K=8)
+- **Optimizer**: Adam, lr=1e-3, weight_decay=1e-4, gradient clipping max_norm=1.0
+- **Schedule**: CosineAnnealingLR, 50 epochs
+- **Hardware**: single NVIDIA RTX 5070 (12 GB)
+
+---
+
+## Acknowledgments
+
+The base FNO scaffold (`fourier_2d.py`, `utilities3.py`, `Adam.py`) is forked from [neuraloperator/Geo-FNO](https://github.com/neuraloperator/Geo-FNO) by Zongyi Li et al. Pure UNet building blocks adapted from the [Pytorch-UNet](https://github.com/milesial/Pytorch-UNet) implementation. Spherical Harmonic Transform operations use [torch_harmonics](https://github.com/NVIDIA/torch-harmonics) (Bonev et al., NVIDIA).

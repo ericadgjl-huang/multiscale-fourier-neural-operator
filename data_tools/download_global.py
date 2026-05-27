@@ -1,3 +1,11 @@
+"""download_global.py — 從 CDS 下載 2021-2023 三年全球 mini-ERA5 資料。
+用法：python data_tools/download_global.py（從專案根目錄執行）
+需要先設定 ~/.cdsapirc 帳號"""
+import os, sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+
 import cdsapi
 
 c = cdsapi.Client()

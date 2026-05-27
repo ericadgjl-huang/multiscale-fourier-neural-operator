@@ -403,7 +403,7 @@ EXPERIMENTS = {
 
 # === 主要旋鈕（這 4 個變數決定要跑哪個實驗）===
 base_experiment_name = 'sutrans_fno'   # ← 從 EXPERIMENTS 挑一個架構
-SEED                 = 0               # ← 改成 1, 2 跑多 seed 驗證
+SEED                 = 2               # ← 改成 1, 2 跑多 seed 驗證
 MODES                = 16              # ← FNO modes（搜尋時可改 24, 32）
 DROPOUT              = 0.0             # ← FNO dropout（搜尋時可改 0.1, 0.2）
 

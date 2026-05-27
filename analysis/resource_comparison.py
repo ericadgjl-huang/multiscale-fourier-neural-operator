@@ -7,11 +7,17 @@ resource_comparison.py
 - Avg epoch time / Total train time：從 training_log.csv 累計
 - Peak GPU memory + Inference latency：載入 model_weights_best.pt 做一次 forward pass 量測
 
+用法：python analysis/resource_comparison.py（從專案根目錄執行）
+
 輸出：
     outputs/_comparison/resource_summary.csv    — paper Table 2 直接可用
     outputs/_comparison/resource_comparison.png — 4 panel bar chart
 """
-import os
+import os, sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+
 import re
 import json
 import glob

@@ -3,19 +3,20 @@ multi_seed_compare.py
 按 base architecture × hyperparams 分組，計算多 seed 的 mean ± std，
 產出統計比較圖與摘要 CSV。
 
-用法：python multi_seed_compare.py
+用法：python analysis/multi_seed_compare.py（從專案根目錄執行）
 
 分組邏輯：把 SEED 變動視為「同一實驗的不同 seed」，但 MODES 與 DROPOUT 變動
-視為「不同實驗」。例如：
-    sufno, sufno_s1, sufno_s2          → 同組 'sufno' (n=3)
-    sufno_drop20, sufno_drop20_s1      → 同組 'sufno_drop20' (n=2)
-    sufno_m24                          → 獨立組 'sufno_m24' (n=1)
+視為「不同實驗」。
 
 輸出：
     outputs/_comparison/multi_seed_summary.csv
     outputs/_comparison/multi_seed_plot.png
 """
-import os
+import os, sys
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+os.chdir(_ROOT)
+sys.path.insert(0, _ROOT)
+
 import re
 import json
 import glob
