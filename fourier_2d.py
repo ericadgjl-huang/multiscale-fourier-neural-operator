@@ -520,6 +520,17 @@ v10 = torch.tensor(ds['v10'].values)
 vimdf = torch.tensor(ds['vimdf'].values)  # 垂直積分水分散度
 vitoe = torch.tensor(ds['vitoe'].values)  # 總能量的垂直積分
 
+# 真實經緯度範圍，供繪圖時把座標軸標成度數（抓不到就用 None → 退回原本的像素索引）
+try:
+    _lons = ds['longitude'].values
+    _lats = ds['latitude'].values
+    geo_extent = [float(_lons.min()), float(_lons.max()),
+                  float(_lats.min()), float(_lats.max())]  # [left, right, bottom, top]
+    print(f"經緯度範圍：lon {geo_extent[0]:.1f}°~{geo_extent[1]:.1f}°, lat {geo_extent[2]:.1f}°~{geo_extent[3]:.1f}°")
+except Exception as _geo_err:
+    geo_extent = None
+    print(f"[警告] 讀取經緯度座標失敗，圖表改用像素索引：{_geo_err}")
+
 times    = ds['valid_time'].values
 dt       = pd.to_datetime(times)
 day_rad  = torch.tensor(dt.dayofyear.values, dtype=torch.float32) * (2 * np.pi / 365.25)
@@ -765,8 +776,8 @@ print(f"學習曲線繪製完成！請查看 {os.path.join(output_dir, 'learning
 ################################################################
 print("正在計算分通道預報技巧分數（RMSE vs Lead Time）...")
 
-var_names_zh = ['溫度 t2m', '海平面氣壓 msl', 'U 風速', 'V 風速', '水分散度 vifd', '總能量 vite']
-var_names_en = ['Temperature (t2m)', 'Pressure (msl)', 'U-Wind', 'V-Wind', 'Moisture Div (vifd)', 'Total Energy (vite)']
+var_names_zh = ['溫度 t2m', '海平面氣壓 msl', 'U 風速', 'V 風速', '水分散度 vimdf', '總能量 vitoe']
+var_names_en = ['Temperature (t2m)', 'Pressure (msl)', 'U-Wind', 'V-Wind', 'Moisture Div (vimdf)', 'Total Energy (vitoe)']
 channel_step_rmse = np.zeros((6, rollout_steps))  
 
 lead_hours = np.arange(1, rollout_steps + 1) * 6
@@ -843,15 +854,22 @@ with torch.no_grad():
         break  # 只畫第一批
 
 idx = 0
+# 有真實經緯度就標成度數座標，否則用像素索引（geo_extent=None）
+_imshow_kw = dict(extent=geo_extent, aspect='auto') if geo_extent is not None else {}
 fig, axes = plt.subplots(len(target_steps), 3, figsize=(15, len(target_steps) * 4))
 for row, (ts, label) in enumerate(zip(target_steps, target_labels)):
     gt   = y[idx, ts, :, :, 0].cpu().numpy()           # 溫度通道 ground truth
     pred = all_preds[ts][idx, :, :, 0].cpu().numpy()   # 溫度通道預測
     err  = gt - pred
 
-    im0 = axes[row, 0].imshow(gt,   cmap='jet');      axes[row, 0].set_title(f'True {label}');   fig.colorbar(im0, ax=axes[row, 0])
-    im1 = axes[row, 1].imshow(pred, cmap='jet');      axes[row, 1].set_title(f'Pred {label}');   fig.colorbar(im1, ax=axes[row, 1])
-    im2 = axes[row, 2].imshow(err,  cmap='coolwarm'); axes[row, 2].set_title(f'Error {label}');  fig.colorbar(im2, ax=axes[row, 2])
+    im0 = axes[row, 0].imshow(gt,   cmap='jet',      **_imshow_kw); axes[row, 0].set_title(f'True {label}');  fig.colorbar(im0, ax=axes[row, 0])
+    im1 = axes[row, 1].imshow(pred, cmap='jet',      **_imshow_kw); axes[row, 1].set_title(f'Pred {label}');  fig.colorbar(im1, ax=axes[row, 1])
+    im2 = axes[row, 2].imshow(err,  cmap='coolwarm', **_imshow_kw); axes[row, 2].set_title(f'Error {label}'); fig.colorbar(im2, ax=axes[row, 2])
+    if geo_extent is not None:
+        axes[row, 0].set_ylabel('Latitude (°)', fontsize=10)
+if geo_extent is not None:
+    for ax in axes[-1, :]:
+        ax.set_xlabel('Longitude (°)', fontsize=10)
 
 plt.suptitle(f'Temperature Prediction Error Maps — {model_name}', fontsize=14, fontweight='bold')
 plt.tight_layout()
