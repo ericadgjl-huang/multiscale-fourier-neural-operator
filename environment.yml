@@ -1,4 +1,4 @@
-name: csap-unet
+name: 4000Ada_unet_cuda
 channels:
   - pytorch
   - defaults

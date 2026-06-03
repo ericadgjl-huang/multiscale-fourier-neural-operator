@@ -5,6 +5,7 @@ This file is the Fourier Neural Operator for 2D problem such as the Darcy Flow d
 # ======================================================================
 # --- 終極版：Windows 系統專用 Triton 雙重攔截補丁 (解決 PyTorch .cuda() 衝突) ---
 # ======================================================================
+import os
 import sys
 import importlib.util
 from types import ModuleType
@@ -42,12 +43,15 @@ import xarray as xr   # <--- 補上這行
 
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
-# --- 新增：強制載入 Windows 系統內的微軟正黑體 ---
+# --- 載入 Windows 系統內的微軟正黑體（找不到字型就跳過，避免在沒有該字型的機器上崩潰）---
 font_path = r"C:\Windows\Fonts\msjh.ttc"
-font_manager.fontManager.addfont(font_path)
-# --- 新增：解決 Matplotlib 中文顯示為方塊的問題 ---
-plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei'] # 設定字體為微軟正黑體
-plt.rcParams['axes.unicode_minus'] = False # 解決座標軸負號 (-) 變方塊的問題
+try:
+    if os.path.exists(font_path):
+        font_manager.fontManager.addfont(font_path)
+        plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei']  # 微軟正黑體
+except Exception as _font_err:
+    print(f"[警告] 載入中文字型失敗，圖表中文可能顯示為方塊（不影響訓練）：{_font_err}")
+plt.rcParams['axes.unicode_minus'] = False  # 解決座標軸負號 (-) 變方塊的問題
 
 import pandas as pd
 
@@ -338,6 +342,8 @@ class FNO2d(nn.Module):
             return SphericalConv2d(self.width, self.width, self.modes1)
         elif self.spectral_type == 'fft':
             return SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+        elif self.spectral_type in ('', 'none'):
+            return None          # 純 local path（例如 2d_unet）：沒有 spectral 分支
         else:
             raise ValueError(f"Unknown spectral_type: {self.spectral_type}")
 
@@ -356,6 +362,14 @@ class FNO2d(nn.Module):
         elif self.local_type == 'none':
             return None
 
+    def _mix(self, conv, w, x):
+        # spectral path 與 local path 相加；任一為 None（如 2d_unet 無 spectral）則只取另一條
+        if conv is not None and w is not None:
+            return conv(x) + w(x)
+        if conv is not None:
+            return conv(x)
+        return w(x)
+
     def forward(self, x):
         grid = self.get_grid(x.shape, x.device)
         x = torch.cat((x, grid), dim=-1)
@@ -363,27 +377,19 @@ class FNO2d(nn.Module):
         x = x.permute(0, 3, 1, 2)
         # x = F.pad(x, [0,self.padding, 0,self.padding])
 
-        x1 = self.conv0(x)
-        x2 = self.w0(x)
-        x = x1 + x2
+        x = self._mix(self.conv0, self.w0, x)
         x = F.gelu(x)
         x = self.dropout_layer(x)
 
-        x1 = self.conv1(x)
-        x2 = self.w1(x)
-        x = x1 + x2
+        x = self._mix(self.conv1, self.w1, x)
         x = F.gelu(x)
         x = self.dropout_layer(x)
 
-        x1 = self.conv2(x)
-        x2 = self.w2(x)
-        x = x1 + x2
+        x = self._mix(self.conv2, self.w2, x)
         x = F.gelu(x)
         x = self.dropout_layer(x)
 
-        x1 = self.conv3(x)
-        x2 = self.w3(x)
-        x = x1 + x2
+        x = self._mix(self.conv3, self.w3, x)
 
         # x = x[..., :-self.padding, :-self.padding]
         x = x.permute(0, 2, 3, 1)
@@ -432,10 +438,22 @@ EXPERIMENTS = {
 }
 
 # === 主要旋鈕（這 4 個變數決定要跑哪個實驗）===
-base_experiment_name = '2d_fno'  # ← 從 EXPERIMENTS 挑一個架構
+base_experiment_name = '2d_fno'  # ← 從 EXPERIMENTS 挑一個架構（也可用命令列覆寫）
 SEED                 = 0               # ← 改成 1, 2 跑多 seed 驗證
 MODES                = 16              # ← FNO modes（搜尋時可改 24, 32）
 DROPOUT              = 0.0             # ← FNO dropout（搜尋時可改 0.1, 0.2）
+
+# 命令列覆寫：python fourier_2d.py <實驗名稱>
+# 5 台電腦各跑一個模型時，不需修改原始碼，直接帶參數即可，例如：
+#   python fourier_2d.py sfno
+if len(sys.argv) > 1:
+    base_experiment_name = sys.argv[1]
+
+if base_experiment_name not in EXPERIMENTS:
+    raise SystemExit(
+        f"[參數錯誤] 未知的實驗名稱：'{base_experiment_name}'\n"
+        f"可用選項：{', '.join(EXPERIMENTS.keys())}"
+    )
 
 cfg = EXPERIMENTS[base_experiment_name]
 
