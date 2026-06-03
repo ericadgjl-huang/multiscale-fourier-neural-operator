@@ -2,6 +2,36 @@
 @author: Zongyi Li
 This file is the Fourier Neural Operator for 2D problem such as the Darcy Flow discussed in Section 5.2 in the [paper](https://arxiv.org/pdf/2010.08895.pdf).
 """
+# ======================================================================
+# --- 終極版：Windows 系統專用 Triton 雙重攔截補丁 (解決 PyTorch .cuda() 衝突) ---
+# ======================================================================
+import sys
+import importlib.util
+from types import ModuleType
+
+# 1. 攔截 PyTorch 內部的 importlib 探測，強制讓 PyTorch 知道 Windows 沒安裝 Triton，安全跳過核心註冊
+orig_find_spec = importlib.util.find_spec
+def hooked_find_spec(name, package=None):
+    if name == 'triton' or name.startswith('triton.'):
+        return None  # 告訴探測機制：沒這個東西
+    return orig_find_spec(name, package)
+importlib.util.find_spec = hooked_find_spec
+
+# 2. 建立虛擬模組，供 torch_harmonics 頂層直接 import 時放行
+class MockTriton(ModuleType):
+    def __getattr__(self, name):
+        if name.startswith('__'):
+            raise AttributeError(name)
+        if name in ('jit', 'autotune', 'heuristics', 'jit_mutator'):
+            return lambda *args, **kwargs: (lambda f: f)
+        return MockTriton(name)
+    def __call__(self, *args, **kwargs):
+        return MockTriton("mock")
+
+sys.modules['triton'] = MockTriton('triton')
+sys.modules['triton.language'] = MockTriton('triton.language')
+# ======================================================================
+
 import torch_harmonics as th
 import numpy as np
 import torch
@@ -281,7 +311,7 @@ class FNO2d(nn.Module):
         self.modes1 = modes1
         self.modes2 = modes2
         self.width = width
-        self.fc0 = nn.Linear(10, self.width)
+        self.fc0 = nn.Linear(12, self.width)
         self.local_type    = local_type
         self.spectral_type = spectral_type
         self.dropout_p     = dropout
@@ -301,7 +331,7 @@ class FNO2d(nn.Module):
         self.dropout_layer = nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity()
 
         self.fc1 = nn.Linear(self.width, 128)
-        self.fc2 = nn.Linear(128, 4)
+        self.fc2 = nn.Linear(128, 6)
 
     def _get_spectral_path(self):
         if self.spectral_type == 'sht':
@@ -394,16 +424,16 @@ class ERA5RolloutDataset(torch.utils.data.Dataset):
 # 實驗設定（PR 3：multi-seed + FNO hyperparam search 旋鈕）
 ################################################################
 EXPERIMENTS = {
-    '2d_fno':      {'local_type': '1x1',           'spectral_type': 'fft', 'display': '2D-FNO Baseline (FFT)'},
-    'sfno':        {'local_type': '1x1',           'spectral_type': 'sht', 'display': 'SFNO (Spherical Baseline)'},
-    'sufno':       {'local_type': 'unet',          'spectral_type': 'sht', 'display': 'SUFNO (Spherical + U-Net)'},
-    'sunetpp_fno': {'local_type': 'advanced_unet', 'spectral_type': 'sht', 'display': 'SU-Net++ FNO (Spherical + Advanced U-Net)'},
-    'sutrans_fno': {'local_type': 'transformer',   'spectral_type': 'sht', 'display': 'SU-Trans FNO (Spherical + Transformer local)'},
+    '2d_fno':    {'local_type': '1x1',    'spectral_type': 'fft', 'display': '2D-FNO Baseline (FFT)'},
+    '2d_ufno':   {'local_type': 'unet',   'spectral_type': 'fft', 'display': '2D-UFNO (FFT + U-Net)'}, # ←新增
+    'sfno':      {'local_type': '1x1',    'spectral_type': 'sht', 'display': 'SFNO (Spherical Baseline)'},
+    'sufno':     {'local_type': 'unet',   'spectral_type': 'sht', 'display': 'SUFNO (Spherical + U-Net)'},
+    '2d_unet':   {'local_type': 'unet',   'spectral_type': '',    'display': '2D U-Net Only'},
 }
 
 # === 主要旋鈕（這 4 個變數決定要跑哪個實驗）===
-base_experiment_name = 'sutrans_fno'   # ← 從 EXPERIMENTS 挑一個架構
-SEED                 = 2               # ← 改成 1, 2 跑多 seed 驗證
+base_experiment_name = '2d_fno'  # ← 從 EXPERIMENTS 挑一個架構
+SEED                 = 0               # ← 改成 1, 2 跑多 seed 驗證
 MODES                = 16              # ← FNO modes（搜尋時可改 24, 32）
 DROPOUT              = 0.0             # ← FNO dropout（搜尋時可改 0.1, 0.2）
 
@@ -447,6 +477,9 @@ print(f"========================================")
 ################################################################
 # 讀取 ERA5 氣象資料與設定
 ################################################################
+TRAIN_VARIABLES = ['t2m', 'msl', 'u10', 'v10', 'vimdf', 'vitoe']
+NUM_CHANNELS    = len(TRAIN_VARIABLES) # 也就是 6
+
 modes           = MODES   # 沿用 PR 3 旋鈕
 width           = 32
 batch_size      = 4
@@ -459,12 +492,15 @@ weight_decay    = 1e-4
 clip_norm       = 1.0
 
 print("正在讀取 ERA5 氣象資料...")
-ds = xr.open_mfdataset('data/global_era5_mini_*.nc', engine='h5netcdf', combine='by_coords')
+ds = xr.open_mfdataset('data/global_era5_6_factors_*.nc', engine='h5netcdf', combine='by_coords')
 
 t2m = torch.tensor(ds['t2m'].values)
 msl = torch.tensor(ds['msl'].values)
 u10 = torch.tensor(ds['u10'].values)
 v10 = torch.tensor(ds['v10'].values)
+# ---- 新增下面兩行 (請根據上方 print 出來的名稱調整 key 值，通常為 vifd 與 vite) ----
+vimdf = torch.tensor(ds['vimdf'].values)  # 垂直積分水分散度
+vitoe = torch.tensor(ds['vitoe'].values)  # 總能量的垂直積分
 
 times    = ds['valid_time'].values
 dt       = pd.to_datetime(times)
@@ -476,7 +512,8 @@ day_cos  = torch.cos(day_rad).view(-1, 1, 1).expand(-1, 33, 64)
 hour_sin = torch.sin(hour_rad).view(-1, 1, 1).expand(-1, 33, 64)
 hour_cos = torch.cos(hour_rad).view(-1, 1, 1).expand(-1, 33, 64)
 
-data = torch.stack([t2m, msl, u10, v10, day_sin, day_cos, hour_sin, hour_cos], dim=-1)
+# 修改後：把 6 個氣象變數堆疊在最前面，時間特徵接在後面
+data = torch.stack([t2m, msl, u10, v10, vimdf, vitoe, day_sin, day_cos, hour_sin, hour_cos], dim=-1)
 data = torch.nan_to_num(data, nan=0.0).float()
 
 # 前兩年 (2021-2022) 訓練，最後一年 (2023) 測試
@@ -553,9 +590,19 @@ with open(config_path, 'w', encoding='utf-8') as f:
 print(f"超參數快照已寫入：{config_path}")
 
 # --- 開啟 CSV 訓練紀錄（每 epoch 即時 append，意外中斷也能保留） ---
+NUM_CHANNELS = 6
+TRAIN_VARIABLES = ['t2m', 'msl', 'u10', 'v10', 'vimdf', 'vitoe']
+
+# --- 開啟 CSV 訓練紀錄（每 epoch 即時 append，意外中斷也能保留） ---
 csv_path = os.path.join(output_dir, 'training_log.csv')
 with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-    csv.writer(f).writerow(['epoch', 'train_mse', 'test_mse', 'lr', 'epoch_time_sec'])
+    header = ['epoch', 'train_mse', 'test_mse', 'lr', 'epoch_time_sec']
+    for ch, var in enumerate(TRAIN_VARIABLES):
+        header.append(f'train_mse_ch{ch}_{var}')
+    for ch, var in enumerate(TRAIN_VARIABLES):
+        header.append(f'test_mse_ch{ch}_{var}')
+    csv.writer(f).writerow(header)
+
 
 # 各時步損失加權係數（step 0 權重最高，越遠越輕）
 step_weights = torch.tensor(
@@ -571,6 +618,9 @@ for ep in range(epochs):
     model.train()
     t1        = default_timer()
     train_mse = 0.0
+    
+    train_mse_per_channel = np.zeros(NUM_CHANNELS)
+    test_mse_per_channel = np.zeros(NUM_CHANNELS)
 
     for x, y in train_loader:
         x, y = x.cuda(), y.cuda()
@@ -578,8 +628,6 @@ for ep in range(epochs):
         batch_mse     = 0.0
 
         # --- Truncated BPTT：每 TBPTT_K 步做一次梯度更新 ---
-        # 好處：把 40 步的計算圖切成 5 段，每段只需要保留 8 步的梯度，
-        #       GPU 記憶體使用量與原本 4 步訓練相近。
         for window_start in range(0, rollout_steps, TBPTT_K):
             window_end  = min(window_start + TBPTT_K, rollout_steps)
             optimizer.zero_grad()
@@ -587,20 +635,28 @@ for ep in range(epochs):
 
             for step in range(window_start, window_end):
                 pred_weather = model(current_input)
-                true_weather = y[:, step, :, :, :4]
-                step_loss    = step_weights[step] * F.mse_loss(pred_weather, true_weather)
-                window_loss  = window_loss + step_loss
-                batch_mse   += F.mse_loss(pred_weather, true_weather).item()
-
+                true_weather = y[:, step, :, :, :NUM_CHANNELS]
+    
+                # 逐通道 MSE
+                mse_per_channel = torch.mean((pred_weather - true_weather) ** 2, dim=(0, 1, 2))
+    
+                # 累加訓練集通道誤差
+                train_mse_per_channel += mse_per_channel.detach().cpu().numpy()
+    
+                step_loss = step_weights[step] * torch.mean(mse_per_channel)
+                window_loss = window_loss + step_loss
+                batch_mse += torch.mean(mse_per_channel).item()
+    
+                # 修正此處原先為 15 個空格的縮排錯誤
                 if step < rollout_steps - 1:
-                    next_time     = y[:, step, :, :, 4:]
+                    next_time = y[:, step, :, :, NUM_CHANNELS:]
                     current_input = torch.cat([pred_weather, next_time], dim=-1)
 
             window_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
             optimizer.step()
 
-            # 在 T-BPTT 視窗邊界截斷計算圖，讓下一段從乾淨狀態開始
+            # 在 T-BPTT 視窗邊界截斷計算圖
             current_input = current_input.detach()
 
         train_mse += batch_mse / rollout_steps
@@ -617,18 +673,31 @@ for ep in range(epochs):
             current_input = x
             for step in range(rollout_steps):
                 pred_weather = model(current_input)
-                true_weather = y[:, step, :, :, :4]
-                test_mse    += F.mse_loss(pred_weather, true_weather).item()
+                true_weather = y[:, step, :, :, :NUM_CHANNELS]  
+                
+                mse_per_channel = torch.mean((pred_weather - true_weather) ** 2, dim=(0, 1, 2))
+                # 補上測試集逐通道誤差累加
+                test_mse_per_channel += mse_per_channel.detach().cpu().numpy()
+                test_mse += torch.mean(mse_per_channel).item()
+                
                 if step < rollout_steps - 1:
-                    next_time     = y[:, step, :, :, 4:]
+                    next_time     = y[:, step, :, :, NUM_CHANNELS:]  
                     current_input = torch.cat([pred_weather, next_time], dim=-1)
 
     train_mse /= len(train_loader)
-    test_mse  /= (len(test_loader) * rollout_steps)
-    t2         = default_timer()
+    train_mse_per_channel /= (len(train_loader) * rollout_steps)
+
+    test_mse /= (len(test_loader) * rollout_steps)
+    test_mse_per_channel /= (len(test_loader) * rollout_steps)
+
+    t2 = default_timer()
     epoch_time = t2 - t1
 
-    # PR 3：追蹤並保存「best test_mse 的權重」（讓後續 ablation 用乾淨的 best snapshot）
+    # 輸出逐通道 MSE
+    print(f"Epoch {ep:02d} | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}")
+    print(f"  Per-channel train MSE: {[f'{x:.4f}' for x in train_mse_per_channel]}")
+    print(f"  Per-channel test MSE:  {[f'{x:.4f}' for x in test_mse_per_channel]}")
+
     is_best = test_mse < best_test_mse
     if is_best:
         best_test_mse = test_mse
@@ -641,16 +710,17 @@ for ep in range(epochs):
     history_train_mse.append(train_mse)
     history_test_mse.append(test_mse)
 
-    # 每 epoch 即時 append 到 CSV（意外中斷也能保留）
+    # 將完整的逐通道數據寫入 CSV 紀錄中
     with open(csv_path, 'a', newline='', encoding='utf-8') as f:
-        csv.writer(f).writerow([ep, train_mse, test_mse, current_lr, epoch_time])
+        row = [ep, train_mse, test_mse, current_lr, epoch_time]
+        row.extend(train_mse_per_channel.tolist())
+        row.extend(test_mse_per_channel.tolist())
+        csv.writer(f).writerow(row)
 
-# --- 訓練結束後儲存最終模型權重（與 best 並存） ---
+# --- 訓練結束後儲存最終模型權重 ---
 weights_path = os.path.join(output_dir, 'model_weights.pt')
 torch.save(model.state_dict(), weights_path)
 print(f"\n最終模型權重已儲存：{weights_path}")
-print(f"最佳模型權重（epoch {best_epoch}, test_mse={best_test_mse:.4f}）："
-      f"{os.path.join(output_dir, 'model_weights_best.pt')}")
 
 # 把 best epoch 資訊補進 config.json
 config_snapshot['best_epoch']        = best_epoch
@@ -677,38 +747,45 @@ print(f"學習曲線繪製完成！請查看 {os.path.join(output_dir, 'learning
 ################################################################
 print("正在計算分通道預報技巧分數（RMSE vs Lead Time）...")
 
-var_names_zh = ['溫度 t2m', '海平面氣壓 msl', 'U 風速', 'V 風速']
-var_names_en = ['Temperature (t2m)', 'Pressure (msl)', 'U-Wind', 'V-Wind']
-lead_hours   = np.arange(1, rollout_steps + 1) * 6   # 6, 12, ..., 240 小時
+var_names_zh = ['溫度 t2m', '海平面氣壓 msl', 'U 風速', 'V 風速', '水分散度 vifd', '總能量 vite']
+var_names_en = ['Temperature (t2m)', 'Pressure (msl)', 'U-Wind', 'V-Wind', 'Moisture Div (vifd)', 'Total Energy (vite)']
+channel_step_rmse = np.zeros((6, rollout_steps))  
 
-channel_step_rmse = np.zeros((4, rollout_steps))
+lead_hours = np.arange(1, rollout_steps + 1) * 6
+
 n_skill_batches   = 0
 model.eval()
 with torch.no_grad():
     for x, y in test_loader:
         x, y = x.cuda(), y.cuda()
         current_input = x
-        step_preds    = []
+        step_preds = []  # 修正：宣告儲存預測時間步的列表
+        
+        # 1. 執行 Rollout 並收集所有時間步的預測結果
         for step in range(rollout_steps):
             pred_weather = model(current_input)
-            step_preds.append(pred_weather.cpu())
+            step_preds.append(pred_weather.detach().cpu())  # 修正：將預測結果存入
+            
             if step < rollout_steps - 1:
-                next_time     = y[:, step, :, :, 4:]
+                next_time = y[:, step, :, :, NUM_CHANNELS:]
                 current_input = torch.cat([pred_weather, next_time], dim=-1)
+                
+        # 2. 計算各通道與時效的 RMSE
         for step in range(rollout_steps):
-            true = y[:, step, :, :, :4].cpu().numpy()
+            true = y[:, step, :, :, :6].cpu().numpy()  
             pred = step_preds[step].numpy()
-            for ch in range(4):
+            for ch in range(6):  
                 channel_step_rmse[ch, step] += np.sqrt(
                     np.mean((pred[:, :, :, ch] - true[:, :, :, ch]) ** 2)
                 )
+                
         n_skill_batches += 1
         if n_skill_batches >= 10:  # 前 10 批足夠評估趨勢
             break
 
 channel_step_rmse /= n_skill_batches
 
-fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+fig, axes = plt.subplots(1, 6, figsize=(28, 5))
 for ch, ax in enumerate(axes):
     ax.plot(lead_hours, channel_step_rmse[ch], linewidth=2, color=f'C{ch}')
     ax.set_title(f'{var_names_en[ch]} RMSE vs Lead Time', fontsize=11)
@@ -743,7 +820,7 @@ with torch.no_grad():
             pred_weather = model(current_input)
             all_preds.append(pred_weather)
             if step < rollout_steps - 1:
-                next_time     = y[:, step, :, :, 4:]
+                next_time     = y[:, step, :, :, 6:]
                 current_input = torch.cat([pred_weather, next_time], dim=-1)
         break  # 只畫第一批
 
