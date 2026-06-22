@@ -1,416 +1,256 @@
 """
-@author: Zongyi Li
-This file is the Fourier Neural Operator for 2D problem such as the Darcy Flow discussed in Section 5.2 in the [paper](https://arxiv.org/pdf/2010.08895.pdf).
+fourier_2d.py — 「單一入口」整合版
+
+一支腳本跑完所有 11 個架構（平面 / FNO 混合 / 純球面）+ 經典基線，
+並支援：
+  * 任意變數數量（4 / 6 / 96 …）：自動偵測 NetCDF 內的氣象通道（含氣壓層展開）
+  * 多卡 / 多機 DDP 訓練（torchrun 啟動；單卡時自動退化成原本行為）
+
+用法（單卡，跑單一架構）：
+    python fourier_2d.py unet_2d
+    python fourier_2d.py sphere_unet --seed 1
+    python fourier_2d.py sufno --modes 16 --dropout 0.1
+
+用法（96 變數 + 多機多卡 DDP，每台機器執行；詳見 walkthrough.md / DISTRIBUTED.md）：
+    torchrun --nnodes=3 --nproc_per_node=2 --node_rank=0 \
+             --master_addr=192.168.0.10 --master_port=29500 \
+             fourier_2d.py unet_2d --data-glob "data/global_era5_96_factors_*.nc"
+
+可用架構名稱見 models.EXPERIMENTS。
 """
 # ======================================================================
-# --- 終極版：Windows 系統專用 Triton 雙重攔截補丁 (解決 PyTorch .cuda() 衝突) ---
+# --- Windows 系統專用 Triton 雙重攔截補丁（解決 torch_harmonics import）---
+# 新版 torch（2.10）不需要；舊環境（torch 2.2.0、Windows 無 triton）需要假 triton。
 # ======================================================================
 import os
 import sys
 import importlib.util
 from types import ModuleType
 
-# 1. 攔截 PyTorch 內部的 importlib 探測，強制讓 PyTorch 知道 Windows 沒安裝 Triton，安全跳過核心註冊
-orig_find_spec = importlib.util.find_spec
-def hooked_find_spec(name, package=None):
-    if name == 'triton' or name.startswith('triton.'):
-        return None  # 告訴探測機制：沒這個東西
-    return orig_find_spec(name, package)
-importlib.util.find_spec = hooked_find_spec
 
-# 2. 建立虛擬模組，供 torch_harmonics 頂層直接 import 時放行
-class MockTriton(ModuleType):
-    def __getattr__(self, name):
-        if name.startswith('__'):
-            raise AttributeError(name)
-        if name in ('jit', 'autotune', 'heuristics', 'jit_mutator'):
-            return lambda *args, **kwargs: (lambda f: f)
-        return MockTriton(name)
-    def __call__(self, *args, **kwargs):
-        return MockTriton("mock")
+def _install_fake_triton():
+    orig_find_spec = importlib.util.find_spec
 
-sys.modules['triton'] = MockTriton('triton')
-sys.modules['triton.language'] = MockTriton('triton.language')
+    def hooked_find_spec(name, package=None):
+        if name == 'triton' or name.startswith('triton.'):
+            return None
+        return orig_find_spec(name, package)
+    importlib.util.find_spec = hooked_find_spec
+
+    class MockTriton(ModuleType):
+        def __getattr__(self, name):
+            if name.startswith('__'):
+                raise AttributeError(name)
+            if name in ('jit', 'autotune', 'heuristics', 'jit_mutator'):
+                return lambda *args, **kwargs: (lambda f: f)
+            return MockTriton(name)
+
+        def __call__(self, *args, **kwargs):
+            return MockTriton("mock")
+
+    sys.modules['triton'] = MockTriton('triton')
+    sys.modules['triton.language'] = MockTriton('triton.language')
+
+
+try:
+    import torch_harmonics as th  # noqa: F401
+    _TH_MSG = "[資訊] torch_harmonics 直接 import 成功，未啟用假 triton 補丁。"
+except Exception as _th_err:
+    _install_fake_triton()
+    import torch_harmonics as th  # noqa: F401
+    _TH_MSG = f"[資訊] torch_harmonics 需要假 triton 補丁，已套用後重試成功（原錯誤：{_th_err}）。"
 # ======================================================================
 
-import torch_harmonics as th
+import argparse
+import json
+import csv
+from timeit import default_timer
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-import xarray as xr   # <--- 補上這行
-
-import matplotlib.pyplot as plt
-from matplotlib import font_manager
-# --- 載入 Windows 系統內的微軟正黑體（找不到字型就跳過，避免在沒有該字型的機器上崩潰）---
-font_path = r"C:\Windows\Fonts\msjh.ttc"
-try:
-    if os.path.exists(font_path):
-        font_manager.fontManager.addfont(font_path)
-        plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei']  # 微軟正黑體
-except Exception as _font_err:
-    print(f"[警告] 載入中文字型失敗，圖表中文可能顯示為方塊（不影響訓練）：{_font_err}")
-plt.rcParams['axes.unicode_minus'] = False  # 解決座標軸負號 (-) 變方塊的問題
-
+import torch.distributed as dist
+import xarray as xr
 import pandas as pd
 
-import os
-import json
-import csv
+import matplotlib
+matplotlib.use('Agg')          # 無顯示環境（伺服器）也能存圖
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
 
-import operator
-from functools import reduce
-from functools import partial
-
-from timeit import default_timer
-from utilities3 import *
-
-from Adam import Adam
-
-torch.manual_seed(0)
-np.random.seed(0)
-
-################################################################
-# local path
-################################################################
-class LocalUNetBlock2d(nn.Module):
-    def __init__(self, width):
-        super(LocalUNetBlock2d, self).__init__()
-        # 升級為 2D 卷積
-        self.down = nn.Conv2d(width, width, kernel_size=3, stride=2, padding=1)
-        self.conv = nn.Conv2d(width, width, kernel_size=3, padding=1)
-        self.final = nn.Conv2d(width, width, 1)
-
-    def forward(self, x):
-        res = x
-        x_down = F.gelu(self.down(x))
-        x_conv = F.gelu(self.conv(x_down))
-        # 2D 上採樣，確保尺寸與輸入一致
-        x_up = F.interpolate(x_conv, size=(res.shape[2], res.shape[3]), mode='bilinear', align_corners=True)
-        return self.final(x_up) + res
-################################################################
-# SphericalConv2d
-################################################################
-class SphericalConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, modes, nlat=33, nlon=64):
-        super(SphericalConv2d, self).__init__()
-        """
-        Spherical Harmonic Transform (SHT) Layer
-        專為地球球面設計，取代傳統的 2D FFT。
-        """
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes = modes # 球面調和函數的最高階數 (lmax, mmax)
-        
-        # 1. 宣告正向與反向的球面調和轉換 (SHT / ISHT)
-        # ERA5 是標準的經緯度網格，所以我們使用 "equiangular"
-        self.sht = th.RealSHT(nlat, nlon, lmax=modes, mmax=modes, grid="equiangular")
-        self.isht = th.InverseRealSHT(nlat, nlon, lmax=modes, mmax=modes, grid="equiangular")
-        
-        # 2. 頻域上的可學習權重 (Complex Weights)
-        self.scale = (1 / (in_channels * out_channels))
-        self.weights = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, modes, modes, dtype=torch.cfloat))
-
-    def forward(self, x):
-        # 正向 SHT：將空間氣象場轉為「球面頻譜」
-        # x shape: (batch, in_channels, nlat, nlon)
-        x_sht = self.sht(x) 
-        
-        # 在頻譜空間中進行矩陣相乘 (過濾與特徵提取)
-        # out shape: (batch, out_channels, lmax, mmax)
-        out_sht = torch.einsum("b i l m, i o l m -> b o l m", x_sht, self.weights)
-        
-        # 反向 ISHT：將處理好的頻譜轉回「空間氣象場」
-        x = self.isht(out_sht)
-        return x
-    
-
-################################################################
-# fourier layer
-################################################################
-class SpectralConv2d(nn.Module):
-    def __init__(self, in_channels, out_channels, modes1, modes2):
-        super(SpectralConv2d, self).__init__()
-
-        """
-        2D Fourier layer. It does FFT, linear transform, and Inverse FFT.    
-        """
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.modes1 = modes1 #Number of Fourier modes to multiply, at most floor(N/2) + 1
-        self.modes2 = modes2
-
-        self.scale = (1 / (in_channels * out_channels))
-        self.weights1 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
-        self.weights2 = nn.Parameter(self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat))
-
-    # Complex multiplication
-    def compl_mul2d(self, input, weights):
-        # (batch, in_channel, x,y ), (in_channel, out_channel, x,y) -> (batch, out_channel, x,y)
-        return torch.einsum("bixy,ioxy->boxy", input, weights)
-
-    def forward(self, x):
-        batchsize = x.shape[0]
-        #Compute Fourier coeffcients up to factor of e^(- something constant)
-        x_ft = torch.fft.rfft2(x)
-
-        # Multiply relevant Fourier modes
-        out_ft = torch.zeros(batchsize, self.out_channels,  x.size(-2), x.size(-1)//2 + 1, dtype=torch.cfloat, device=x.device)
-        out_ft[:, :, :self.modes1, :self.modes2] = \
-            self.compl_mul2d(x_ft[:, :, :self.modes1, :self.modes2], self.weights1)
-        out_ft[:, :, -self.modes1:, :self.modes2] = \
-            self.compl_mul2d(x_ft[:, :, -self.modes1:, :self.modes2], self.weights2)
-
-        #Return to physical space
-        x = torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
-        return x
-
-class AdvancedUNetBlock2d(nn.Module):
-    def __init__(self, width):
-        super(AdvancedUNetBlock2d, self).__init__()
-        # --- Encoder (編碼器：提取深層特徵，通道數倍增) ---
-        self.down1 = nn.Conv2d(width, width*2, kernel_size=3, stride=2, padding=1)
-        self.conv1 = nn.Conv2d(width*2, width*2, kernel_size=3, padding=1)
-
-        self.down2 = nn.Conv2d(width*2, width*2, kernel_size=3, stride=2, padding=1)
-        self.conv2 = nn.Conv2d(width*2, width*2, kernel_size=3, padding=1)
-
-        # --- Decoder (解碼器：結合淺層輪廓與深層語意) ---
-        # 接收 width*2 (來自上採樣) + width*2 (來自 Encoder) = width*4
-        self.up1 = nn.Conv2d(width*4, width*2, kernel_size=3, padding=1) 
-        # 接收 width*2 (來自上採樣) + width (來自最原來的輸入) = width*3
-        self.up2 = nn.Conv2d(width*3, width, kernel_size=3, padding=1)   
-
-        self.final = nn.Conv2d(width, width, 1)
-
-    def forward(self, x):
-        res = x  # 最外層的殘差
-
-        # --- 下採樣路徑 ---
-        e1 = x 
-        d1 = F.gelu(self.down1(e1))
-        c1 = F.gelu(self.conv1(d1)) # 縮小 1/2
-
-        d2 = F.gelu(self.down2(c1))
-        c2 = F.gelu(self.conv2(d2)) # 縮小 1/4
-
-        # --- 上採樣與特徵拼接 (Skip Connection) ---
-        # 放大回 1/2，並與 c1 拼接
-        u1 = F.interpolate(c2, size=(c1.shape[2], c1.shape[3]), mode='bilinear', align_corners=True)
-        concat1 = torch.cat([u1, c1], dim=1)
-        u1_conv = F.gelu(self.up1(concat1))
-
-        # 放大回原尺寸，並與 e1 拼接
-        u2 = F.interpolate(u1_conv, size=(e1.shape[2], e1.shape[3]), mode='bilinear', align_corners=True)
-        concat2 = torch.cat([u2, e1], dim=1)
-        u2_conv = F.gelu(self.up2(concat2))
-
-        return self.final(u2_conv) + res
-
-class ConvNeXtBlock2d(nn.Module):
-    def __init__(self, width):
-        super(ConvNeXtBlock2d, self).__init__()
-        # 1. Depthwise Convolution (超大 7x7 卷積核，不縮小圖片，捕捉廣域氣象特徵)
-        self.dwconv = nn.Conv2d(width, width, kernel_size=7, padding=3, groups=width)
-        
-        # 2. Layer Normalization (氣象資料各變數差異大，Norm 能幫助穩定)
-        self.norm = nn.GroupNorm(1, width) 
-        
-        # 3. Pointwise Convolution (特徵維度放大 4 倍再壓縮，這是 Transformer 的精髓)
-        self.pwconv1 = nn.Conv2d(width, 4 * width, 1) 
-        self.pwconv2 = nn.Conv2d(4 * width, width, 1) 
-
-    def forward(self, x):
-        res = x
-        x = self.dwconv(x)
-        x = self.norm(x)
-        x = self.pwconv1(x)
-        x = F.gelu(x)
-        x = self.pwconv2(x)
-        return x + res
-
-################################################################
-# Transformer building blocks（PR 5：sutrans_fno 用）
-# 從 transunet_baseline.py 複製，避免 import 引發 transunet 整個訓練腳本執行
-################################################################
-class TransformerBottleneck(nn.Module):
-    """
-    把 (B, C, H, W) flatten 成 (B, H*W, C) tokens 餵給 transformer，
-    再 reshape 回 (B, C, H, W)。pre-norm（norm_first=True）提升訓練穩定度。
-    """
-    def __init__(self, channels, max_tokens, n_layers=4, n_heads=4, ffn_mult=4, dropout=0.0):
-        super().__init__()
-        self.channels   = channels
-        self.max_tokens = max_tokens
-
-        self.pos_emb = nn.Parameter(torch.zeros(1, max_tokens, channels))
-        nn.init.trunc_normal_(self.pos_emb, std=0.02)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model         = channels,
-            nhead           = n_heads,
-            dim_feedforward = channels * ffn_mult,
-            dropout         = dropout,
-            activation      = 'gelu',
-            batch_first     = True,
-            norm_first      = True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.norm_out    = nn.LayerNorm(channels)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        n_tokens   = H * W
-        assert n_tokens <= self.max_tokens, \
-            f"序列長度 {n_tokens} 超過位置編碼上限 {self.max_tokens}"
-
-        x = x.flatten(2).transpose(1, 2)
-        x = x + self.pos_emb[:, :n_tokens, :]
-        x = self.transformer(x)
-        x = self.norm_out(x)
-        x = x.transpose(1, 2).reshape(B, C, H, W)
-        return x
+from utilities3 import count_params
+from models import EXPERIMENTS, build_model
 
 
-class TransformerLocalBlock(nn.Module):
-    """
-    FNO local path 的 transformer 版本：
-    1. Down-sample 4× (stride-4 conv)：33×64 → 9×16 (144 tokens)
-    2. Transformer self-attention at low resolution（attention 矩陣只有 144²）
-    3. Bilinear upsample 回到原解析度
-    記憶體量級與 TransUNet bottleneck 相同。
-    """
-    def __init__(self, width, n_layers=2, n_heads=4, dropout=0.0):
-        super().__init__()
-        self.down = nn.Conv2d(width, width, kernel_size=3, stride=4, padding=1)
-        self.transformer = TransformerBottleneck(
-            channels   = width,
-            max_tokens = 200,
-            n_layers   = n_layers,
-            n_heads    = n_heads,
-            dropout    = dropout,
-        )
+# ======================================================================
+# 0. 命令列參數
+# ======================================================================
+def parse_args():
+    p = argparse.ArgumentParser(description="When Sphere Hurts — 整合版單一入口訓練腳本")
+    p.add_argument('arch', nargs='?', default='unet_2d',
+                   help=f"架構名稱，可選：{', '.join(EXPERIMENTS.keys())}")
+    p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--modes', type=int, default=16, help='FNO modes（球面模型用 --sphere-modes）')
+    p.add_argument('--dropout', type=float, default=0.0)
+    p.add_argument('--epochs', type=int, default=50)
+    p.add_argument('--batch-size', type=int, default=4, help='每張 GPU 的 batch size')
+    p.add_argument('--base-width', type=int, default=32)
+    p.add_argument('--rollout-steps', type=int, default=40)
+    p.add_argument('--tbptt-k', type=int, default=8)
+    p.add_argument('--train-size', type=int, default=2920, help='訓練集時間步數（其餘為測試集）')
+    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--weight-decay', type=float, default=1e-4)
+    p.add_argument('--clip-norm', type=float, default=1.0)
+    p.add_argument('--step-loss-gamma', type=float, default=0.95)
+    p.add_argument('--sphere-modes', type=str, default='8,4,2',
+                   help='純球面模型每層 SHT modes，逗號分隔')
+    p.add_argument('--data-glob', type=str, default='data/global_era5_6_factors_*.nc',
+                   help='ERA5 NetCDF glob；換 96 變數請指向對應檔案')
+    p.add_argument('--vars', type=str, default='',
+                   help='逗號分隔的變數白名單；留空＝自動偵測 NetCDF 內所有氣象變數')
+    p.add_argument('--output-root', type=str, default='outputs')
+    p.add_argument('--num-workers', type=int, default=0)
+    p.add_argument('--ddp-backend', type=str, default='auto',
+                   choices=['auto', 'nccl', 'gloo'],
+                   help='分散式後端；auto＝Linux+CUDA 用 nccl，否則 gloo')
+    p.add_argument('--skill-plot-channels', type=int, default=4,
+                   help='forecast skill 圖最多畫幾個通道（96 變數時避免畫爆）')
+    return p.parse_args()
 
-    def forward(self, x):
-        H_in, W_in = x.shape[2], x.shape[3]
-        z = self.down(x)
-        z = self.transformer(z)
-        z = F.interpolate(z, size=(H_in, W_in), mode='bilinear', align_corners=True)
-        return z
 
+# ======================================================================
+# 1. DDP 工具
+# ======================================================================
+def setup_distributed(backend_choice):
+    """讀取 torchrun 注入的環境變數；回傳 (use_ddp, rank, local_rank, world_size, device)。"""
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    rank = int(os.environ.get('RANK', '0'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    use_ddp = world_size > 1
 
-class FNO2d(nn.Module):
-    def __init__(self, modes1, modes2, width, local_type='1x1', spectral_type='sht', dropout=0.0):
-        super(FNO2d, self).__init__()
-
-        """
-        4 層 spectral block + 4 層 local path 的混合結構。
-        spectral_type: 'sht'（球面調和，SFNO 系列）或 'fft'（標準 2D-FNO）
-        local_type:    '1x1' / 'unet' / 'advanced_unet' / 'convnext'
-        dropout:       每個 spectral block GELU 後的 Dropout2d 機率（0 = 關閉，零開銷）
-        """
-
-        self.modes1 = modes1
-        self.modes2 = modes2
-        self.width = width
-        self.fc0 = nn.Linear(12, self.width)
-        self.local_type    = local_type
-        self.spectral_type = spectral_type
-        self.dropout_p     = dropout
-
-        # spectral path：FFT 或 SHT 二選一
-        self.conv0 = self._get_spectral_path()
-        self.conv1 = self._get_spectral_path()
-        self.conv2 = self._get_spectral_path()
-        self.conv3 = self._get_spectral_path()
-        # local path：1x1 / U-Net / Advanced U-Net / ConvNeXt
-        self.w0 = self._get_local_path()
-        self.w1 = self._get_local_path()
-        self.w2 = self._get_local_path()
-        self.w3 = self._get_local_path()
-
-        # Dropout（channel-wise，spatial）：dropout=0 為 Identity，零開銷
-        self.dropout_layer = nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity()
-
-        self.fc1 = nn.Linear(self.width, 128)
-        self.fc2 = nn.Linear(128, 6)
-
-    def _get_spectral_path(self):
-        if self.spectral_type == 'sht':
-            return SphericalConv2d(self.width, self.width, self.modes1)
-        elif self.spectral_type == 'fft':
-            return SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
-        elif self.spectral_type in ('', 'none'):
-            return None          # 純 local path（例如 2d_unet）：沒有 spectral 分支
+    if use_ddp:
+        if backend_choice == 'auto':
+            backend = 'nccl' if (torch.cuda.is_available() and sys.platform != 'win32') else 'gloo'
         else:
-            raise ValueError(f"Unknown spectral_type: {self.spectral_type}")
+            backend = backend_choice
+        dist.init_process_group(backend=backend, init_method='env://')
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f'cuda:{local_rank}')
+        else:
+            device = torch.device('cpu')
+        if rank == 0:
+            print(f"[DDP] backend={backend} world_size={world_size}")
+    else:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    def _get_local_path(self):
-        if self.local_type == '1x1':
-            return nn.Conv2d(self.width, self.width, 1)
-        elif self.local_type == 'unet':
-            return LocalUNetBlock2d(self.width)
-        elif self.local_type == 'advanced_unet':
-            return AdvancedUNetBlock2d(self.width)
-        elif self.local_type == 'convnext':
-            return ConvNeXtBlock2d(self.width)
-        elif self.local_type == 'transformer':
-            return TransformerLocalBlock(self.width, n_layers=2, n_heads=4,
-                                          dropout=self.dropout_p)
-        elif self.local_type == 'none':
-            return None
+    return use_ddp, rank, local_rank, world_size, device
 
-    def _mix(self, conv, w, x):
-        # spectral path 與 local path 相加；任一為 None（如 2d_unet 無 spectral）則只取另一條
-        if conv is not None and w is not None:
-            return conv(x) + w(x)
-        if conv is not None:
-            return conv(x)
-        return w(x)
 
-    def forward(self, x):
-        grid = self.get_grid(x.shape, x.device)
-        x = torch.cat((x, grid), dim=-1)
-        x = self.fc0(x)
-        x = x.permute(0, 3, 1, 2)
-        # x = F.pad(x, [0,self.padding, 0,self.padding])
+def is_main_process(rank):
+    return rank == 0
 
-        x = self._mix(self.conv0, self.w0, x)
-        x = F.gelu(x)
-        x = self.dropout_layer(x)
 
-        x = self._mix(self.conv1, self.w1, x)
-        x = F.gelu(x)
-        x = self.dropout_layer(x)
+def reduce_sum_(tensor_like, device, use_ddp):
+    """把 numpy 陣列或 python 純量做跨 rank SUM；非 DDP 時原樣回傳。"""
+    if not use_ddp:
+        return tensor_like
+    t = torch.as_tensor(np.asarray(tensor_like, dtype=np.float64), device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    out = t.cpu().numpy()
+    return out if out.ndim > 0 else float(out)
 
-        x = self._mix(self.conv2, self.w2, x)
-        x = F.gelu(x)
-        x = self.dropout_layer(x)
 
-        x = self._mix(self.conv3, self.w3, x)
+# ======================================================================
+# 2. 資料載入（自動偵測變數 / 氣壓層展開 → 支援 4 / 6 / 96 變數）
+# ======================================================================
+def _name_of(ds, candidates):
+    for c in candidates:
+        if c in ds.dims or c in ds.coords:
+            return c
+    return None
 
-        # x = x[..., :-self.padding, :-self.padding]
-        x = x.permute(0, 2, 3, 1)
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.fc2(x)
-        return x
-    
-    def get_grid(self, shape, device):
-        batchsize, size_x, size_y = shape[0], shape[1], shape[2]
-        gridx = torch.tensor(np.linspace(0, 1, size_x), dtype=torch.float)
-        gridx = gridx.reshape(1, size_x, 1, 1).repeat([batchsize, 1, size_y, 1])
-        gridy = torch.tensor(np.linspace(0, 1, size_y), dtype=torch.float)
-        gridy = gridy.reshape(1, 1, size_y, 1).repeat([batchsize, size_x, 1, 1])
-        return torch.cat((gridx, gridy), dim=-1).to(device)
 
-################################################################
-# ERA5RolloutDataset：動態切片，避免預先建構龐大 y_data 張量
-# 40 步版本若預先建構 y_data 會消耗 ~12 GB RAM，改用 Dataset 即時切片
-################################################################
+def load_era5(data_glob, var_whitelist, verbose=True):
+    """
+    回傳：
+      data_meteo : (T, nlat, nlon, C_meteo) float32 tensor
+      times      : pandas DatetimeIndex（長度 T）
+      channel_names : list[str]，長度 C_meteo
+      geo_extent : [lon_min, lon_max, lat_min, lat_max] 或 None
+      nlat, nlon
+    """
+    ds = xr.open_mfdataset(data_glob, engine='h5netcdf', combine='by_coords')
+
+    lat_name = _name_of(ds, ['latitude', 'lat'])
+    lon_name = _name_of(ds, ['longitude', 'lon'])
+    time_name = _name_of(ds, ['valid_time', 'time'])
+    if lat_name is None or lon_name is None or time_name is None:
+        raise RuntimeError(f"無法辨識 lat/lon/time 維度，實際 dims={list(ds.dims)}")
+
+    nlat = int(ds.sizes[lat_name])
+    nlon = int(ds.sizes[lon_name])
+
+    if var_whitelist:
+        var_list = [v.strip() for v in var_whitelist.split(',') if v.strip()]
+    else:
+        # 保留 NetCDF 內原本的變數順序（下載順序），確保 channel 0 = 第一個下載變數
+        var_list = list(ds.data_vars)
+
+    # CDS 偶爾會帶 expver / number 這類非垂直維度（如混到 ERA5T 近即時資料）；
+    # 這些不是氣壓層，取第 0 個壓平，避免被誤展開成假通道。
+    SQUEEZE_DIMS = ('expver', 'number', 'realization')
+
+    channels = []
+    channel_names = []
+    for v in var_list:
+        da = ds[v]
+        for sd in SQUEEZE_DIMS:
+            if sd in da.dims:
+                da = da.isel({sd: 0}, drop=True)
+        other_dims = [d for d in da.dims if d not in (time_name, lat_name, lon_name)]
+        if not other_dims:
+            channels.append(da)
+            channel_names.append(v)
+        else:
+            level_dim = other_dims[0]               # 氣壓層維度（pressure_level / level / isobaricInhPa）
+            for lev in da[level_dim].values:
+                channels.append(da.sel({level_dim: lev}))
+                channel_names.append(f"{v}{int(lev)}")
+
+    if verbose:
+        print(f"偵測到 {len(channel_names)} 個氣象通道（{nlat}×{nlon} 網格）")
+
+    # 逐通道轉 tensor 並 stack 到最後一維 → (T, nlat, nlon, C)
+    arrs = [torch.as_tensor(np.asarray(c.values), dtype=torch.float32) for c in channels]
+    data_meteo = torch.stack(arrs, dim=-1)
+    data_meteo = torch.nan_to_num(data_meteo, nan=0.0)
+
+    times = pd.to_datetime(ds[time_name].values)
+
+    try:
+        lons = ds[lon_name].values
+        lats = ds[lat_name].values
+        geo_extent = [float(lons.min()), float(lons.max()),
+                      float(lats.min()), float(lats.max())]
+    except Exception:
+        geo_extent = None
+
+    return data_meteo, times, channel_names, geo_extent, nlat, nlon
+
+
+def build_time_channels(times, nlat, nlon):
+    """day-of-year / hour-of-day 的 sin/cos，共 4 通道，broadcast 成 (T, nlat, nlon, 4)。"""
+    day_rad = torch.tensor(times.dayofyear.values, dtype=torch.float32) * (2 * np.pi / 365.25)
+    hour_rad = torch.tensor(times.hour.values, dtype=torch.float32) * (2 * np.pi / 24.0)
+    feats = [torch.sin(day_rad), torch.cos(day_rad), torch.sin(hour_rad), torch.cos(hour_rad)]
+    feats = [f.view(-1, 1, 1).expand(-1, nlat, nlon) for f in feats]
+    return torch.stack(feats, dim=-1)
+
+
 class ERA5RolloutDataset(torch.utils.data.Dataset):
+    """動態切片：x=(nlat,nlon,C)；y=(rollout_steps, nlat, nlon, C)。"""
     def __init__(self, data, start_idx, count, rollout_steps):
         self.data = data
         self.start_idx = start_idx
@@ -422,483 +262,406 @@ class ERA5RolloutDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         i = self.start_idx + idx
-        x = self.data[i]                                    # (33, 64, 8)
-        y = self.data[i + 1 : i + 1 + self.rollout_steps]  # (rollout_steps, 33, 64, 8)
+        x = self.data[i]
+        y = self.data[i + 1:i + 1 + self.rollout_steps]
         return x, y
 
-################################################################
-# 實驗設定（PR 3：multi-seed + FNO hyperparam search 旋鈕）
-################################################################
-EXPERIMENTS = {
-    '2d_fno':    {'local_type': '1x1',    'spectral_type': 'fft', 'display': '2D-FNO Baseline (FFT)'},
-    '2d_ufno':   {'local_type': 'unet',   'spectral_type': 'fft', 'display': '2D-UFNO (FFT + U-Net)'}, # ←新增
-    'sfno':      {'local_type': '1x1',    'spectral_type': 'sht', 'display': 'SFNO (Spherical Baseline)'},
-    'sufno':     {'local_type': 'unet',   'spectral_type': 'sht', 'display': 'SUFNO (Spherical + U-Net)'},
-    '2d_unet':   {'local_type': 'unet',   'spectral_type': '',    'display': '2D U-Net Only'},
-}
 
-# === 主要旋鈕（這 4 個變數決定要跑哪個實驗）===
-base_experiment_name = '2d_fno'  # ← 從 EXPERIMENTS 挑一個架構（也可用命令列覆寫）
-SEED                 = 0               # ← 改成 1, 2 跑多 seed 驗證
-MODES                = 16              # ← FNO modes（搜尋時可改 24, 32）
-DROPOUT              = 0.0             # ← FNO dropout（搜尋時可改 0.1, 0.2）
+# ======================================================================
+# 3. 主程式
+# ======================================================================
+def main():
+    args = parse_args()
+    use_ddp, rank, local_rank, world_size, device = setup_distributed(args.ddp_backend)
+    main_proc = is_main_process(rank)
 
-# 命令列覆寫：python fourier_2d.py <實驗名稱>
-# 5 台電腦各跑一個模型時，不需修改原始碼，直接帶參數即可，例如：
-#   python fourier_2d.py sfno
-if len(sys.argv) > 1:
-    base_experiment_name = sys.argv[1]
+    if main_proc:
+        print(_TH_MSG)
 
-if base_experiment_name not in EXPERIMENTS:
-    raise SystemExit(
-        f"[參數錯誤] 未知的實驗名稱：'{base_experiment_name}'\n"
-        f"可用選項：{', '.join(EXPERIMENTS.keys())}"
-    )
+    if args.arch not in EXPERIMENTS:
+        raise SystemExit(f"[參數錯誤] 未知架構 '{args.arch}'。可用：{', '.join(EXPERIMENTS.keys())}")
+    cfg = EXPERIMENTS[args.arch]
 
-cfg = EXPERIMENTS[base_experiment_name]
+    # --- 中文字型（找不到就略過，不影響訓練）---
+    if main_proc:
+        try:
+            font_path = r"C:\Windows\Fonts\msjh.ttc"
+            if os.path.exists(font_path):
+                font_manager.fontManager.addfont(font_path)
+                plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei']
+        except Exception as e:
+            print(f"[警告] 載入中文字型失敗：{e}")
+        plt.rcParams['axes.unicode_minus'] = False
 
-# 自動產生 experiment_name 後綴（預設值不會加後綴 → 保持與舊 baseline 同名）
-suffix_parts = []
-if SEED != 0:
-    suffix_parts.append(f's{SEED}')
-if MODES != 16:
-    suffix_parts.append(f'm{MODES}')
-if DROPOUT > 0:
-    suffix_parts.append(f'drop{int(round(DROPOUT*100))}')
-suffix = ('_' + '_'.join(suffix_parts)) if suffix_parts else ''
-experiment_name = base_experiment_name + suffix
+    # --- random seed ---
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-output_dir = os.path.join('outputs', experiment_name)
+    # --- 輸出資料夾名稱（與舊 baseline 命名相容：seed/modes/dropout 預設值不加後綴）---
+    suffix_parts = []
+    if args.seed != 0:
+        suffix_parts.append(f's{args.seed}')
+    if args.modes != 16:
+        suffix_parts.append(f'm{args.modes}')
+    if args.dropout > 0:
+        suffix_parts.append(f'drop{int(round(args.dropout * 100))}')
+    suffix = ('_' + '_'.join(suffix_parts)) if suffix_parts else ''
+    experiment_name = args.arch + suffix
+    output_dir = os.path.join(args.output_root, experiment_name)
 
-# 防止意外覆蓋既有結果（如 outputs/sunetpp_fno/ 已是 PR 1+2 baseline）
-if os.path.exists(os.path.join(output_dir, 'training_log.csv')):
-    raise FileExistsError(
-        f"\n[防覆蓋保護] 輸出資料夾 {output_dir} 已存在完整訓練紀錄！\n"
-        f"如需重跑請先：\n"
-        f"  1. 改 SEED / DROPOUT / MODES 變數產生新後綴，或\n"
-        f"  2. 手動刪除 {output_dir} 整個資料夾"
-    )
+    # 防覆蓋（所有 rank 都看得到同一路徑 → 一起 raise，不會卡住 collective）
+    if os.path.exists(os.path.join(output_dir, 'training_log.csv')):
+        raise FileExistsError(
+            f"\n[防覆蓋保護] {output_dir} 已有完整訓練紀錄！\n"
+            f"請改 --seed / --modes / --dropout 產生新後綴，或手動刪除該資料夾。")
 
-os.makedirs(output_dir, exist_ok=True)
+    if main_proc:
+        os.makedirs(output_dir, exist_ok=True)
 
-# 設定 random seed（涵蓋 torch / numpy / cuda）
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-torch.cuda.manual_seed_all(SEED)
+    # --- 超參數 ---
+    sphere_modes = tuple(int(x) for x in args.sphere_modes.split(','))
+    rollout_steps = args.rollout_steps
+    TBPTT_K = args.tbptt_k
 
-print(f"========================================")
-print(f" 實驗：{experiment_name}  →  {cfg['display']}")
-print(f" 輸出資料夾：{output_dir}")
-print(f" SEED={SEED} | MODES={MODES} | DROPOUT={DROPOUT}")
-print(f"========================================")
+    # DDP 用 static_graph 包裝（因 TBPTT 一次 backward 重複用到參數）。
+    # static_graph 要求每個 backward 的計算圖一致 → 每個 TBPTT 視窗的 forward 次數必須相同，
+    # 也就是 rollout_steps 必須能被 tbptt_k 整除（預設 40 / 8 = 5，符合）。
+    if use_ddp and rollout_steps % TBPTT_K != 0:
+        raise SystemExit(
+            f"[DDP 限制] rollout_steps({rollout_steps}) 必須能被 tbptt_k({TBPTT_K}) 整除，"
+            f"static_graph 才能正確處理 TBPTT。請調整 --tbptt-k（例如 8 或 10）。")
 
-################################################################
-# 讀取 ERA5 氣象資料與設定
-################################################################
-TRAIN_VARIABLES = ['t2m', 'msl', 'u10', 'v10', 'vimdf', 'vitoe']
-NUM_CHANNELS    = len(TRAIN_VARIABLES) # 也就是 6
+    # --- 讀資料（每個 rank 各自讀；同機多卡會重複佔記憶體，但程式最簡單）---
+    if main_proc:
+        print(f"正在讀取 ERA5（glob={args.data_glob}）...")
+    data_meteo, times, channel_names, geo_extent, nlat, nlon = load_era5(
+        args.data_glob, args.vars, verbose=main_proc)
+    NUM_CHANNELS = data_meteo.shape[-1]
+    time_ch = build_time_channels(times, nlat, nlon)
+    data = torch.cat([data_meteo, time_ch], dim=-1).float()   # (T, nlat, nlon, C_meteo+4)
 
-modes           = MODES   # 沿用 PR 3 旋鈕
-width           = 32
-batch_size      = 4
-epochs          = 50
-rollout_steps   = 40   # 10 天中期預測（6 小時/步 × 40 步 = 240 小時）
-TBPTT_K         = 8    # Truncated BPTT 視窗：每 8 步截斷計算圖，防止 40 步梯度鏈導致記憶體爆炸
-step_loss_gamma = 0.95 # 越遠的時步誤差權重遞減，避免遠期梯度淹沒近期學習訊號
-lr              = 0.001
-weight_decay    = 1e-4
-clip_norm       = 1.0
+    train_size = args.train_size
+    total_size = len(data)
+    if total_size <= train_size + rollout_steps:
+        raise SystemExit(f"[資料錯誤] 總步數 {total_size} 不足以切出 train_size={train_size} + rollout={rollout_steps}")
 
-print("正在讀取 ERA5 氣象資料...")
-ds = xr.open_mfdataset('data/global_era5_6_factors_*.nc', engine='h5netcdf', combine='by_coords')
+    # 標準化：僅用訓練集統計量（含時間通道一起標準化，與原腳本一致）
+    x_mean = data[:train_size].mean(dim=(0, 1, 2))
+    x_std = data[:train_size].std(dim=(0, 1, 2))
+    data_norm = (data - x_mean) / (x_std + 1e-6)
 
-t2m = torch.tensor(ds['t2m'].values)
-msl = torch.tensor(ds['msl'].values)
-u10 = torch.tensor(ds['u10'].values)
-v10 = torch.tensor(ds['v10'].values)
-# ---- 新增下面兩行 (請根據上方 print 出來的名稱調整 key 值，通常為 vifd 與 vite) ----
-vimdf = torch.tensor(ds['vimdf'].values)  # 垂直積分水分散度
-vitoe = torch.tensor(ds['vitoe'].values)  # 總能量的垂直積分
+    train_dataset = ERA5RolloutDataset(data_norm, 0, train_size, rollout_steps)
+    test_dataset = ERA5RolloutDataset(data_norm, train_size,
+                                      total_size - train_size - rollout_steps, rollout_steps)
 
-# 真實經緯度範圍，供繪圖時把座標軸標成度數（抓不到就用 None → 退回原本的像素索引）
-try:
-    _lons = ds['longitude'].values
-    _lats = ds['latitude'].values
-    geo_extent = [float(_lons.min()), float(_lons.max()),
-                  float(_lats.min()), float(_lats.max())]  # [left, right, bottom, top]
-    print(f"經緯度範圍：lon {geo_extent[0]:.1f}°~{geo_extent[1]:.1f}°, lat {geo_extent[2]:.1f}°~{geo_extent[3]:.1f}°")
-except Exception as _geo_err:
-    geo_extent = None
-    print(f"[警告] 讀取經緯度座標失敗，圖表改用像素索引：{_geo_err}")
+    if use_ddp:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(
+            test_dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, sampler=train_sampler,
+            num_workers=args.num_workers, drop_last=True)
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset, batch_size=args.batch_size, sampler=test_sampler,
+            num_workers=args.num_workers)
+    else:
+        train_sampler = None
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-times    = ds['valid_time'].values
-dt       = pd.to_datetime(times)
-day_rad  = torch.tensor(dt.dayofyear.values, dtype=torch.float32) * (2 * np.pi / 365.25)
-hour_rad = torch.tensor(dt.hour.values,      dtype=torch.float32) * (2 * np.pi / 24.0)
+    # --- 建模型 ---
+    model = build_model(args.arch, num_channels=NUM_CHANNELS, base_width=args.base_width,
+                        modes=args.modes, dropout=args.dropout,
+                        nlat=nlat, nlon=nlon, sphere_modes=sphere_modes).to(device)
+    param_count = count_params(model)
 
-day_sin  = torch.sin(day_rad).view(-1, 1, 1).expand(-1, 33, 64)
-day_cos  = torch.cos(day_rad).view(-1, 1, 1).expand(-1, 33, 64)
-hour_sin = torch.sin(hour_rad).view(-1, 1, 1).expand(-1, 33, 64)
-hour_cos = torch.cos(hour_rad).view(-1, 1, 1).expand(-1, 33, 64)
+    if use_ddp:
+        # 小 batch 的 BatchNorm 跨卡同步，統計量才正確
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        ddp_kwargs = dict(static_graph=True)   # TBPTT 一次 backward 重複用到參數 → 需 static_graph
+        if torch.cuda.is_available():
+            ddp_kwargs['device_ids'] = [local_rank]
+        model = nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
+    core_model = model.module if use_ddp else model
 
-# 修改後：把 6 個氣象變數堆疊在最前面，時間特徵接在後面
-data = torch.stack([t2m, msl, u10, v10, vimdf, vitoe, day_sin, day_cos, hour_sin, hour_cos], dim=-1)
-data = torch.nan_to_num(data, nan=0.0).float()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
 
-# 前兩年 (2021-2022) 訓練，最後一年 (2023) 測試
-train_size = 2920
-total_size = len(data)
+    model_name = cfg['display']
+    if main_proc:
+        print("========================================")
+        print(f" 實驗：{experiment_name}  →  {model_name}")
+        print(f" 輸出：{output_dir}")
+        print(f" 變數數：{NUM_CHANNELS} | 網格：{nlat}×{nlon} | 參數量：{param_count}")
+        print(f" SEED={args.seed} MODES={args.modes} DROPOUT={args.dropout} "
+              f"DDP={use_ddp} (world_size={world_size})")
+        print("========================================")
 
-# 標準化：僅用訓練集統計量，防止資料洩漏到測試集
-x_mean    = data[:train_size].mean(dim=(0, 1, 2))  # (8,)
-x_std     = data[:train_size].std(dim=(0, 1, 2))   # (8,)
-data_norm = (data - x_mean) / (x_std + 1e-6)
+    # --- config.json（rank0）---
+    config_snapshot = {
+        'experiment_name': experiment_name, 'base_experiment_name': args.arch,
+        'display_name': model_name, 'family': cfg['family'],
+        'num_channels': NUM_CHANNELS, 'channel_names': channel_names,
+        'nlat': nlat, 'nlon': nlon,
+        'seed': args.seed, 'modes': args.modes, 'dropout': args.dropout,
+        'sphere_modes': list(sphere_modes), 'base_width': args.base_width,
+        'batch_size_per_gpu': args.batch_size, 'world_size': world_size, 'ddp': use_ddp,
+        'epochs': args.epochs, 'rollout_steps': rollout_steps, 'TBPTT_K': TBPTT_K,
+        'step_loss_gamma': args.step_loss_gamma, 'lr': args.lr,
+        'weight_decay': args.weight_decay, 'clip_norm': args.clip_norm,
+        'train_size': train_size, 'total_size': total_size,
+        'param_count': param_count, 'data_glob': args.data_glob,
+        'optimizer': 'Adam', 'scheduler': 'CosineAnnealingLR',
+    }
+    config_path = os.path.join(output_dir, 'config.json')
+    csv_path = os.path.join(output_dir, 'training_log.csv')
+    if main_proc:
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config_snapshot, f, indent=2, ensure_ascii=False)
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            header = ['epoch', 'train_mse', 'test_mse', 'lr', 'epoch_time_sec']
+            header += [f'train_mse_ch{c}_{n}' for c, n in enumerate(channel_names)]
+            header += [f'test_mse_ch{c}_{n}' for c, n in enumerate(channel_names)]
+            csv.writer(f).writerow(header)
 
-train_dataset = ERA5RolloutDataset(data_norm, start_idx=0,
-                                   count=train_size,
-                                   rollout_steps=rollout_steps)
-test_dataset  = ERA5RolloutDataset(data_norm, start_idx=train_size,
-                                   count=total_size - train_size - rollout_steps,
-                                   rollout_steps=rollout_steps)
+    step_weights = torch.tensor(
+        [args.step_loss_gamma ** i for i in range(rollout_steps)], dtype=torch.float32).to(device)
 
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-test_loader  = torch.utils.data.DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
+    history_train_mse, history_test_mse = [], []
+    best_test_mse, best_epoch = float('inf'), -1
 
-################################################################
-# 訓練與評估
-################################################################
-model = FNO2d(modes, modes, width,
-              local_type=cfg['local_type'],
-              spectral_type=cfg['spectral_type'],
-              dropout=DROPOUT).cuda()
-print(f"模型總參數數量: {count_params(model)}")
+    # ==================================================================
+    # 訓練迴圈
+    # ==================================================================
+    for ep in range(args.epochs):
+        if use_ddp:
+            train_sampler.set_epoch(ep)
+        model.train()
+        t1 = default_timer()
 
-optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-# CosineAnnealing 比 StepLR 更適合長步預測：學習率平滑衰減，避免後期震盪
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+        train_loss_accum = 0.0
+        n_train_batches = 0
+        train_mse_pc = np.zeros(NUM_CHANNELS)
 
-model_name = cfg['display']
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            current_input = x
+            batch_mse = 0.0
 
-print(f"========================================")
-print(f" 正在啟動訓練：{model_name}")
-print(f" Spectral 引擎：{cfg['spectral_type'].upper()}")
-print(f" Local 路徑：{cfg['local_type']}")
-print(f" 預測步數：{rollout_steps} 步（{rollout_steps * 6 // 24} 天）")
-print(f" T-BPTT 視窗：{TBPTT_K} 步")
-print(f" 模型總參數：{count_params(model)}")
-print(f"========================================")
+            for window_start in range(0, rollout_steps, TBPTT_K):
+                window_end = min(window_start + TBPTT_K, rollout_steps)
+                optimizer.zero_grad()
+                window_loss = torch.tensor(0.0, device=device)
 
-# --- 把超參數快照寫進 config.json（之後可 reproduce） ---
-config_snapshot = {
-    'experiment_name':      experiment_name,
-    'base_experiment_name': base_experiment_name,   # PR 3：multi-seed 分組用
-    'display_name':         cfg['display'],
-    'local_type':           cfg['local_type'],
-    'spectral_type':        cfg['spectral_type'],
-    'seed':                 SEED,                   # PR 3 旋鈕
-    'modes':                modes,
-    'dropout':              DROPOUT,                # PR 3 旋鈕
-    'width':                width,
-    'batch_size':           batch_size,
-    'epochs':               epochs,
-    'rollout_steps':        rollout_steps,
-    'TBPTT_K':              TBPTT_K,
-    'step_loss_gamma':      step_loss_gamma,
-    'lr':                   lr,
-    'weight_decay':         weight_decay,
-    'clip_norm':            clip_norm,
-    'train_size':           train_size,
-    'total_size':           total_size,
-    'param_count':          count_params(model),
-    'optimizer':            'Adam',
-    'scheduler':            'CosineAnnealingLR',
-}
-config_path = os.path.join(output_dir, 'config.json')
-with open(config_path, 'w', encoding='utf-8') as f:
-    json.dump(config_snapshot, f, indent=2, ensure_ascii=False)
-print(f"超參數快照已寫入：{config_path}")
+                for step in range(window_start, window_end):
+                    pred = model(current_input)
+                    true = y[:, step, :, :, :NUM_CHANNELS]
+                    mse_pc = torch.mean((pred - true) ** 2, dim=(0, 1, 2))
+                    train_mse_pc += mse_pc.detach().cpu().numpy()
+                    window_loss = window_loss + step_weights[step] * torch.mean(mse_pc)
+                    batch_mse += torch.mean(mse_pc).item()
+                    if step < rollout_steps - 1:
+                        next_time = y[:, step, :, :, NUM_CHANNELS:]
+                        current_input = torch.cat([pred, next_time], dim=-1)
 
-# --- 開啟 CSV 訓練紀錄（每 epoch 即時 append，意外中斷也能保留） ---
-NUM_CHANNELS = 6
-TRAIN_VARIABLES = ['t2m', 'msl', 'u10', 'v10', 'vimdf', 'vitoe']
+                window_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_norm)
+                optimizer.step()
+                current_input = current_input.detach()
 
-# --- 開啟 CSV 訓練紀錄（每 epoch 即時 append，意外中斷也能保留） ---
-csv_path = os.path.join(output_dir, 'training_log.csv')
-with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-    header = ['epoch', 'train_mse', 'test_mse', 'lr', 'epoch_time_sec']
-    for ch, var in enumerate(TRAIN_VARIABLES):
-        header.append(f'train_mse_ch{ch}_{var}')
-    for ch, var in enumerate(TRAIN_VARIABLES):
-        header.append(f'test_mse_ch{ch}_{var}')
-    csv.writer(f).writerow(header)
+            train_loss_accum += batch_mse / rollout_steps
+            n_train_batches += 1
+
+        current_lr = optimizer.param_groups[0]['lr']
+        scheduler.step()
+
+        # ---- 測試 ----
+        model.eval()
+        test_loss_accum = 0.0
+        n_test_steps = 0          # batches * rollout_steps
+        test_mse_pc = np.zeros(NUM_CHANNELS)
+        with torch.no_grad():
+            for x, y in test_loader:
+                x, y = x.to(device), y.to(device)
+                current_input = x
+                for step in range(rollout_steps):
+                    pred = model(current_input)
+                    true = y[:, step, :, :, :NUM_CHANNELS]
+                    mse_pc = torch.mean((pred - true) ** 2, dim=(0, 1, 2))
+                    test_mse_pc += mse_pc.detach().cpu().numpy()
+                    test_loss_accum += torch.mean(mse_pc).item()
+                    n_test_steps += 1
+                    if step < rollout_steps - 1:
+                        next_time = y[:, step, :, :, NUM_CHANNELS:]
+                        current_input = torch.cat([pred, next_time], dim=-1)
+
+        # ---- 跨 rank 匯總 ----
+        g_train_loss = reduce_sum_(train_loss_accum, device, use_ddp)
+        g_train_batches = reduce_sum_(n_train_batches, device, use_ddp)
+        g_train_pc = reduce_sum_(train_mse_pc, device, use_ddp)
+        g_test_loss = reduce_sum_(test_loss_accum, device, use_ddp)
+        g_test_steps = reduce_sum_(n_test_steps, device, use_ddp)
+        g_test_pc = reduce_sum_(test_mse_pc, device, use_ddp)
+
+        train_mse = g_train_loss / max(g_train_batches, 1)
+        train_mse_pc_avg = g_train_pc / max(g_train_batches * rollout_steps, 1)
+        test_mse = g_test_loss / max(g_test_steps, 1)
+        test_mse_pc_avg = g_test_pc / max(g_test_steps, 1)
+
+        epoch_time = default_timer() - t1
+        history_train_mse.append(train_mse)
+        history_test_mse.append(test_mse)
+
+        is_best = test_mse < best_test_mse
+        if is_best:
+            best_test_mse, best_epoch = test_mse, ep
+            if main_proc:
+                torch.save(core_model.state_dict(), os.path.join(output_dir, 'model_weights_best.pt'))
+
+        if main_proc:
+            marker = "  ← new best" if is_best else ""
+            print(f"Epoch {ep:02d} | {epoch_time:.1f}s | LR {current_lr:.2e} | "
+                  f"Train {train_mse:.4f} | Test {test_mse:.4f}{marker}")
+            with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+                row = [ep, train_mse, test_mse, current_lr, epoch_time]
+                row += list(np.asarray(train_mse_pc_avg).ravel())
+                row += list(np.asarray(test_mse_pc_avg).ravel())
+                csv.writer(f).writerow(row)
+
+    # ==================================================================
+    # 收尾（rank0 才存權重、畫圖）
+    # ==================================================================
+    if not main_proc:
+        if use_ddp:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
+
+    torch.save(core_model.state_dict(), os.path.join(output_dir, 'model_weights.pt'))
+    config_snapshot['best_epoch'] = best_epoch
+    config_snapshot['best_test_mse'] = best_test_mse
+    config_snapshot['final_test_mse'] = history_test_mse[-1]
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config_snapshot, f, indent=2, ensure_ascii=False)
+    print(f"\n最終/最佳模型權重已存於 {output_dir}/")
+
+    make_plots(core_model, test_loader, device, output_dir, model_name, rollout_steps,
+               NUM_CHANNELS, channel_names, geo_extent, history_train_mse, history_test_mse,
+               n_skill_channels=min(args.skill_plot_channels, NUM_CHANNELS))
+
+    if use_ddp:
+        dist.barrier()
+        dist.destroy_process_group()
+    print(f"\n========== 全部完成！結果在 {output_dir}/ ==========")
 
 
-# 各時步損失加權係數（step 0 權重最高，越遠越輕）
-step_weights = torch.tensor(
-    [step_loss_gamma ** i for i in range(rollout_steps)], dtype=torch.float32
-).cuda()
+# ======================================================================
+# 4. 視覺化（rank0）
+# ======================================================================
+def make_plots(model, test_loader, device, output_dir, model_name, rollout_steps,
+               NUM_CHANNELS, channel_names, geo_extent, history_train_mse, history_test_mse,
+               n_skill_channels=4):
+    # --- 學習曲線 ---
+    plt.figure(figsize=(10, 6))
+    plt.plot(history_train_mse, label='Train MSE', linewidth=2)
+    plt.plot(history_test_mse, label='Test MSE', linewidth=2)
+    plt.xlabel('Epochs'); plt.ylabel('MSE Loss')
+    plt.title(f'Learning Curve — {model_name} ({rollout_steps * 6 // 24}-Day Forecast)')
+    plt.legend(); plt.grid(True)
+    plt.savefig(os.path.join(output_dir, 'learning_curve.png'), dpi=200, bbox_inches='tight')
+    plt.close()
 
-history_train_mse = []
-history_test_mse  = []
-best_test_mse     = float('inf')   # PR 3：追蹤最佳 epoch
-best_epoch        = -1
-
-for ep in range(epochs):
-    model.train()
-    t1        = default_timer()
-    train_mse = 0.0
-    
-    train_mse_per_channel = np.zeros(NUM_CHANNELS)
-    test_mse_per_channel = np.zeros(NUM_CHANNELS)
-
-    for x, y in train_loader:
-        x, y = x.cuda(), y.cuda()
-        current_input = x
-        batch_mse     = 0.0
-
-        # --- Truncated BPTT：每 TBPTT_K 步做一次梯度更新 ---
-        for window_start in range(0, rollout_steps, TBPTT_K):
-            window_end  = min(window_start + TBPTT_K, rollout_steps)
-            optimizer.zero_grad()
-            window_loss = torch.tensor(0.0, device=x.device)
-
-            for step in range(window_start, window_end):
-                pred_weather = model(current_input)
-                true_weather = y[:, step, :, :, :NUM_CHANNELS]
-    
-                # 逐通道 MSE
-                mse_per_channel = torch.mean((pred_weather - true_weather) ** 2, dim=(0, 1, 2))
-    
-                # 累加訓練集通道誤差
-                train_mse_per_channel += mse_per_channel.detach().cpu().numpy()
-    
-                step_loss = step_weights[step] * torch.mean(mse_per_channel)
-                window_loss = window_loss + step_loss
-                batch_mse += torch.mean(mse_per_channel).item()
-    
-                # 修正此處原先為 15 個空格的縮排錯誤
-                if step < rollout_steps - 1:
-                    next_time = y[:, step, :, :, NUM_CHANNELS:]
-                    current_input = torch.cat([pred_weather, next_time], dim=-1)
-
-            window_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
-            optimizer.step()
-
-            # 在 T-BPTT 視窗邊界截斷計算圖
-            current_input = current_input.detach()
-
-        train_mse += batch_mse / rollout_steps
-
-    current_lr = optimizer.param_groups[0]['lr']
-    scheduler.step()
-
-    # --- 測試迴圈（無梯度，純前向推演）---
+    # --- forecast skill（只畫前 n_skill_channels 個通道）---
+    nP = max(1, n_skill_channels)
+    lead_hours = np.arange(1, rollout_steps + 1) * 6
+    channel_step_rmse = np.zeros((nP, rollout_steps))
+    n_batches = 0
     model.eval()
-    test_mse = 0.0
     with torch.no_grad():
         for x, y in test_loader:
-            x, y = x.cuda(), y.cuda()
+            x, y = x.to(device), y.to(device)
             current_input = x
+            step_preds = []
             for step in range(rollout_steps):
-                pred_weather = model(current_input)
-                true_weather = y[:, step, :, :, :NUM_CHANNELS]  
-                
-                mse_per_channel = torch.mean((pred_weather - true_weather) ** 2, dim=(0, 1, 2))
-                # 補上測試集逐通道誤差累加
-                test_mse_per_channel += mse_per_channel.detach().cpu().numpy()
-                test_mse += torch.mean(mse_per_channel).item()
-                
+                pred = model(current_input)
+                step_preds.append(pred.detach().cpu())
                 if step < rollout_steps - 1:
-                    next_time     = y[:, step, :, :, NUM_CHANNELS:]  
-                    current_input = torch.cat([pred_weather, next_time], dim=-1)
+                    current_input = torch.cat([pred, y[:, step, :, :, NUM_CHANNELS:]], dim=-1)
+            for step in range(rollout_steps):
+                true = y[:, step, :, :, :NUM_CHANNELS].cpu().numpy()
+                pred = step_preds[step].numpy()
+                for ch in range(nP):
+                    channel_step_rmse[ch, step] += np.sqrt(np.mean((pred[..., ch] - true[..., ch]) ** 2))
+            n_batches += 1
+            if n_batches >= 10:
+                break
+    channel_step_rmse /= max(n_batches, 1)
 
-    train_mse /= len(train_loader)
-    train_mse_per_channel /= (len(train_loader) * rollout_steps)
+    fig, axes = plt.subplots(1, nP, figsize=(5 * nP, 5), squeeze=False)
+    for ch in range(nP):
+        ax = axes[0, ch]
+        ax.plot(lead_hours, channel_step_rmse[ch], linewidth=2, color=f'C{ch}')
+        ax.set_title(f'{channel_names[ch]} RMSE vs Lead Time', fontsize=11)
+        ax.set_xlabel('Forecast Lead Time (hours)'); ax.set_ylabel('RMSE (normalized)')
+        ax.axvline(x=120, color='orange', linestyle='--', alpha=0.8, label='Day 5')
+        ax.axvline(x=240, color='red', linestyle='--', alpha=0.8, label='Day 10')
+        ax.legend(); ax.grid(True, alpha=0.4)
+    plt.suptitle(f'Forecast Skill — {model_name}', fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'forecast_skill.png'), dpi=200, bbox_inches='tight')
+    plt.close()
 
-    test_mse /= (len(test_loader) * rollout_steps)
-    test_mse_per_channel /= (len(test_loader) * rollout_steps)
-
-    t2 = default_timer()
-    epoch_time = t2 - t1
-
-    # 輸出逐通道 MSE
-    print(f"Epoch {ep:02d} | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}")
-    print(f"  Per-channel train MSE: {[f'{x:.4f}' for x in train_mse_per_channel]}")
-    print(f"  Per-channel test MSE:  {[f'{x:.4f}' for x in test_mse_per_channel]}")
-
-    is_best = test_mse < best_test_mse
-    if is_best:
-        best_test_mse = test_mse
-        best_epoch    = ep
-        torch.save(model.state_dict(), os.path.join(output_dir, 'model_weights_best.pt'))
-
-    marker = "  ← new best" if is_best else ""
-    print(f"Epoch {ep:02d} | 耗時: {epoch_time:.1f}s | LR: {current_lr:.2e} | Train MSE: {train_mse:.4f} | Test MSE: {test_mse:.4f}{marker}")
-
-    history_train_mse.append(train_mse)
-    history_test_mse.append(test_mse)
-
-    # 將完整的逐通道數據寫入 CSV 紀錄中
-    with open(csv_path, 'a', newline='', encoding='utf-8') as f:
-        row = [ep, train_mse, test_mse, current_lr, epoch_time]
-        row.extend(train_mse_per_channel.tolist())
-        row.extend(test_mse_per_channel.tolist())
-        csv.writer(f).writerow(row)
-
-# --- 訓練結束後儲存最終模型權重 ---
-weights_path = os.path.join(output_dir, 'model_weights.pt')
-torch.save(model.state_dict(), weights_path)
-print(f"\n最終模型權重已儲存：{weights_path}")
-
-# 把 best epoch 資訊補進 config.json
-config_snapshot['best_epoch']        = best_epoch
-config_snapshot['best_test_mse']     = best_test_mse
-config_snapshot['final_test_mse']    = history_test_mse[-1]
-with open(config_path, 'w', encoding='utf-8') as f:
-    json.dump(config_snapshot, f, indent=2, ensure_ascii=False)
-
-# --- 學習曲線 ---
-plt.figure(figsize=(10, 6))
-plt.plot(history_train_mse, label='Train MSE', linewidth=2)
-plt.plot(history_test_mse,  label='Test MSE',  linewidth=2)
-plt.xlabel('Epochs', fontsize=14)
-plt.ylabel('MSE Loss', fontsize=14)
-plt.title(f'Learning Curve — {model_name} ({rollout_steps * 6 // 24}-Day Forecast)', fontsize=16)
-plt.legend(fontsize=12)
-plt.grid(True)
-plt.savefig(os.path.join(output_dir, 'learning_curve.png'), dpi=300, bbox_inches='tight')
-plt.close()
-print(f"學習曲線繪製完成！請查看 {os.path.join(output_dir, 'learning_curve.png')}")
-
-################################################################
-# 視覺化 1：各預報時效分通道 RMSE（技巧分數圖）
-################################################################
-print("正在計算分通道預報技巧分數（RMSE vs Lead Time）...")
-
-var_names_zh = ['溫度 t2m', '海平面氣壓 msl', 'U 風速', 'V 風速', '水分散度 vimdf', '總能量 vitoe']
-var_names_en = ['Temperature (t2m)', 'Pressure (msl)', 'U-Wind', 'V-Wind', 'Moisture Div (vimdf)', 'Total Energy (vitoe)']
-channel_step_rmse = np.zeros((6, rollout_steps))  
-
-lead_hours = np.arange(1, rollout_steps + 1) * 6
-
-n_skill_batches   = 0
-model.eval()
-with torch.no_grad():
-    for x, y in test_loader:
-        x, y = x.cuda(), y.cuda()
-        current_input = x
-        step_preds = []  # 修正：宣告儲存預測時間步的列表
-        
-        # 1. 執行 Rollout 並收集所有時間步的預測結果
-        for step in range(rollout_steps):
-            pred_weather = model(current_input)
-            step_preds.append(pred_weather.detach().cpu())  # 修正：將預測結果存入
-            
-            if step < rollout_steps - 1:
-                next_time = y[:, step, :, :, NUM_CHANNELS:]
-                current_input = torch.cat([pred_weather, next_time], dim=-1)
-                
-        # 2. 計算各通道與時效的 RMSE
-        for step in range(rollout_steps):
-            true = y[:, step, :, :, :6].cpu().numpy()  
-            pred = step_preds[step].numpy()
-            for ch in range(6):  
-                channel_step_rmse[ch, step] += np.sqrt(
-                    np.mean((pred[:, :, :, ch] - true[:, :, :, ch]) ** 2)
-                )
-                
-        n_skill_batches += 1
-        if n_skill_batches >= 10:  # 前 10 批足夠評估趨勢
+    # --- 多時效誤差熱點圖（通道 0）---
+    target_steps = [min(s, rollout_steps - 1) for s in (3, 11, 27, 39)]
+    target_labels = ['Day 1 (T+4)', 'Day 3 (T+12)', 'Day 7 (T+28)', 'Day 10 (T+40)']
+    model.eval()
+    with torch.no_grad():
+        for x, y in test_loader:
+            x, y = x.to(device), y.to(device)
+            current_input = x
+            all_preds = []
+            for step in range(rollout_steps):
+                pred = model(current_input)
+                all_preds.append(pred)
+                if step < rollout_steps - 1:
+                    current_input = torch.cat([pred, y[:, step, :, :, NUM_CHANNELS:]], dim=-1)
             break
 
-channel_step_rmse /= n_skill_batches
+    idx = 0
+    kw = dict(extent=geo_extent, aspect='auto') if geo_extent is not None else {}
+    fig, axes = plt.subplots(len(target_steps), 3, figsize=(15, len(target_steps) * 4))
+    for row, (ts, label) in enumerate(zip(target_steps, target_labels)):
+        gt = y[idx, ts, :, :, 0].cpu().numpy()
+        pr = all_preds[ts][idx, :, :, 0].cpu().numpy()
+        err = gt - pr
+        im0 = axes[row, 0].imshow(gt, cmap='jet', **kw); axes[row, 0].set_title(f'True {label}'); fig.colorbar(im0, ax=axes[row, 0])
+        im1 = axes[row, 1].imshow(pr, cmap='jet', **kw); axes[row, 1].set_title(f'Pred {label}'); fig.colorbar(im1, ax=axes[row, 1])
+        im2 = axes[row, 2].imshow(err, cmap='coolwarm', **kw); axes[row, 2].set_title(f'Error {label}'); fig.colorbar(im2, ax=axes[row, 2])
+    plt.suptitle(f'{channel_names[0]} Prediction Error Maps — {model_name}', fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'weather_prediction.png'), dpi=200, bbox_inches='tight')
+    plt.close()
 
-fig, axes = plt.subplots(1, 6, figsize=(28, 5))
-for ch, ax in enumerate(axes):
-    ax.plot(lead_hours, channel_step_rmse[ch], linewidth=2, color=f'C{ch}')
-    ax.set_title(f'{var_names_en[ch]} RMSE vs Lead Time', fontsize=11)
-    ax.set_xlabel('Forecast Lead Time (hours)', fontsize=10)
-    ax.set_ylabel('RMSE (normalized)', fontsize=10)
-    ax.axvline(x=120, color='orange', linestyle='--', alpha=0.8, label='Day 5')
-    ax.axvline(x=240, color='red',    linestyle='--', alpha=0.8, label='Day 10')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.4)
-plt.suptitle(f'Forecast Skill — {model_name}', fontsize=14, fontweight='bold')
-plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'forecast_skill.png'), dpi=300, bbox_inches='tight')
-plt.close()
-print(f"技巧分數圖繪製完成！請查看 {os.path.join(output_dir, 'forecast_skill.png')}")
+    # --- 3D 球體圖（通道 0，Day 10）---
+    temp_pred = all_preds[-1][idx, :, :, 0].cpu().numpy()
+    lon = np.linspace(0, 2 * np.pi, temp_pred.shape[1])
+    lat = np.linspace(0, np.pi, temp_pred.shape[0])
+    lon, lat = np.meshgrid(lon, lat)
+    X, Y, Z = np.sin(lat) * np.cos(lon), np.sin(lat) * np.sin(lon), np.cos(lat)
+    tn = (temp_pred - temp_pred.min()) / (temp_pred.max() - temp_pred.min() + 1e-6)
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d'); ax.axis('off')
+    ax.plot_surface(X, Y, Z, facecolors=plt.cm.jet(tn), rstride=1, cstride=1, antialiased=True, shade=False)
+    ax.set_title(f"Global Prediction — Day {rollout_steps * 6 // 24} Forecast")
+    plt.savefig(os.path.join(output_dir, 'weather_prediction_3d.png'), dpi=200, bbox_inches='tight')
+    plt.close()
+    print("圖表（learning_curve / forecast_skill / weather_prediction / 3d）已輸出。")
 
-################################################################
-# 視覺化 2：多時效誤差熱點圖（Day 1 / Day 3 / Day 7 / Day 10）
-################################################################
-print("正在繪製多時效誤差熱點圖...")
 
-# 展示 4 個代表性時效（溫度通道）
-target_steps  = [3, 11, 27, 39]   # 0-indexed：T+4/12/28/40 步
-target_labels = ['Day 1 (T+4)', 'Day 3 (T+12)', 'Day 7 (T+28)', 'Day 10 (T+40)']
-
-model.eval()
-with torch.no_grad():
-    for x, y in test_loader:
-        x, y = x.cuda(), y.cuda()
-        current_input = x
-        all_preds     = []
-        for step in range(rollout_steps):
-            pred_weather = model(current_input)
-            all_preds.append(pred_weather)
-            if step < rollout_steps - 1:
-                next_time     = y[:, step, :, :, 6:]
-                current_input = torch.cat([pred_weather, next_time], dim=-1)
-        break  # 只畫第一批
-
-idx = 0
-# 有真實經緯度就標成度數座標，否則用像素索引（geo_extent=None）
-_imshow_kw = dict(extent=geo_extent, aspect='auto') if geo_extent is not None else {}
-fig, axes = plt.subplots(len(target_steps), 3, figsize=(15, len(target_steps) * 4))
-for row, (ts, label) in enumerate(zip(target_steps, target_labels)):
-    gt   = y[idx, ts, :, :, 0].cpu().numpy()           # 溫度通道 ground truth
-    pred = all_preds[ts][idx, :, :, 0].cpu().numpy()   # 溫度通道預測
-    err  = gt - pred
-
-    im0 = axes[row, 0].imshow(gt,   cmap='jet',      **_imshow_kw); axes[row, 0].set_title(f'True {label}');  fig.colorbar(im0, ax=axes[row, 0])
-    im1 = axes[row, 1].imshow(pred, cmap='jet',      **_imshow_kw); axes[row, 1].set_title(f'Pred {label}');  fig.colorbar(im1, ax=axes[row, 1])
-    im2 = axes[row, 2].imshow(err,  cmap='coolwarm', **_imshow_kw); axes[row, 2].set_title(f'Error {label}'); fig.colorbar(im2, ax=axes[row, 2])
-    if geo_extent is not None:
-        axes[row, 0].set_ylabel('Latitude (°)', fontsize=10)
-if geo_extent is not None:
-    for ax in axes[-1, :]:
-        ax.set_xlabel('Longitude (°)', fontsize=10)
-
-plt.suptitle(f'Temperature Prediction Error Maps — {model_name}', fontsize=14, fontweight='bold')
-plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'weather_prediction.png'), dpi=300, bbox_inches='tight')
-plt.close()
-print(f"多時效誤差熱點圖繪製完成！請查看 {os.path.join(output_dir, 'weather_prediction.png')}")
-
-################################################################
-# 視覺化 3：3D 球體預測圖（Day 10 最終時效）
-################################################################
-print("正在繪製 3D 球體預測圖...")
-temp_pred = all_preds[-1][idx, :, :, 0].cpu().numpy()
-
-lon = np.linspace(0, 2 * np.pi, 64)
-lat = np.linspace(0, np.pi, 33)
-lon, lat = np.meshgrid(lon, lat)
-X = np.sin(lat) * np.cos(lon)
-Y = np.sin(lat) * np.sin(lon)
-Z = np.cos(lat)
-
-temp_norm = (temp_pred - temp_pred.min()) / (temp_pred.max() - temp_pred.min() + 1e-6)
-colors    = plt.cm.jet(temp_norm)
-
-fig = plt.figure(figsize=(10, 10))
-ax  = fig.add_subplot(111, projection='3d')
-ax.axis('off')
-ax.plot_surface(X, Y, Z, facecolors=colors, rstride=1, cstride=1, antialiased=True, shade=False)
-ax.set_title(f"Global Temp Prediction — Day {rollout_steps * 6 // 24} Forecast", fontsize=16, pad=20)
-plt.savefig(os.path.join(output_dir, 'weather_prediction_3d.png'), dpi=300, bbox_inches='tight')
-plt.close()
-print(f"3D 繪圖完成！請查看 {os.path.join(output_dir, 'weather_prediction_3d.png')}")
-print(f"\n========== 全部完成！所有結果已儲存至 {output_dir}/ ==========")
+if __name__ == '__main__':
+    main()

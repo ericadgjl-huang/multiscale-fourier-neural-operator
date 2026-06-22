@@ -1,16 +1,14 @@
 name: 4000Ada_unet_cuda
 channels:
   - pytorch
-  - defaults
   - conda-forge
+  - defaults
 dependencies:
   - python=3.11
   - numpy=1.26.4
   - scipy=1.11.4
   - pandas=2.2.3
-  - scikit-learn=1.3.2
   - matplotlib=3.8.0
-  - tqdm
   - xarray
   - netcdf4
   - h5py
@@ -18,16 +16,15 @@ dependencies:
   - dask
   - pip
   - pip:
-    - --index-url https://download.pytorch.org/whl/cu121
-    - torch==2.2.0
-    - torchvision==0.17.0
-    - opencv-python==4.10.0.84
-    - opencv-python-headless==4.10.0.84
-    - tifffile==2024.2.12
-    - einops==0.6.1
-    - albumentations==1.3.1
-    - segmentation-models-pytorch==0.3.3
-    - imageio==2.34.0
-    - thop==0.1.1.post2209072238
-    - timm==0.9.2
-    - torch-harmonics==0.6.5
+    # 用 --extra-index-url（不要用 --index-url）：
+    #   --index-url 會「取代」整個 PyPI，導致 pip 跑去 PyTorch 伺服器找 opencv 等套件而失敗；
+    #   --extra-index-url 是「加在 PyPI 之外」，torch 從這裡抓、其餘從 PyPI 抓。
+    - --extra-index-url https://download.pytorch.org/whl/cu121
+    # +cu121 的本地版本標籤可確保抓到 CUDA 12.1 build（PyPI 沒有此標籤，只會在上面這個 index 找到）
+    - torch==2.2.0+cu121
+    - cdsapi
+    # ⚠ torch-harmonics 不放這裡：它相依 triton，而 triton 在 Windows 沒有輪檔，
+    #   放進來會讓 conda env create 失敗。請在環境建好後「手動」裝（兩個平台都適用）：
+    #       conda activate 4000Ada_unet_cuda
+    #       pip install torch-harmonics==0.6.5 --no-deps
+    #   （--no-deps 跳過 triton；本專案執行時用 fourier_2d.py 內建的假 triton 補丁處理）
