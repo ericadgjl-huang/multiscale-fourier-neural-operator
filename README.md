@@ -16,6 +16,32 @@ A systematic 3×3 ablation study comparing **architecture (UNet / UNet++ / Trans
 
 ---
 
+## 🆕 整合版（單一入口 + 任意變數數 + 多機多卡 DDP）
+
+為了 96 變數的 TAAI 投稿實驗，本資料夾已把**全部 11 個架構 + 基線**整合進**同一支** `fourier_2d.py`，
+並支援任意變數數（4 / 6 / 96，自動偵測 NetCDF 通道，含氣壓層展開）與 DDP 多機多卡訓練。
+
+```bash
+# 單卡，任一架構（6 變數現成資料）
+python fourier_2d.py unet_2d
+python fourier_2d.py sphere_unet --seed 1
+
+# 96 變數：先下載 96 個 single-level 變數，再指定 --data-glob
+python data_tools/download_global_96_factors.py
+python fourier_2d.py unet_2d --data-glob "data/global_era5_96_factors_*.nc"
+
+# 多機多卡 DDP（詳見 DISTRIBUTED.md / run_ddp.sh / run_ddp.ps1）
+torchrun --nnodes=3 --nproc_per_node=2 --node_rank=0 \
+         --master_addr=192.168.0.10 --master_port=29500 \
+         fourier_2d.py unet_2d --data-glob "data/global_era5_96_factors_*.nc"
+```
+
+- 架構定義與工廠：`models.py`（`EXPERIMENTS` 註冊表列出所有可用名稱）。
+- 多機多卡、後端選擇（Linux NCCL / Windows gloo）、96 變數工作流程：見 **`DISTRIBUTED.md`**。
+- 原本散落的 `*_baseline.py`、`sphere_blocks.py` 已全部整併進 `models.py`，不再需要。
+
+---
+
 ## Project Structure
 
 ```

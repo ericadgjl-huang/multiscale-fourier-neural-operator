@@ -188,7 +188,7 @@ for group in REP_ARCHS:
             if step < ROLLOUT_STEPS - 1:
                 next_time = y_in[:, step, :, :, NUM_CHANNELS:]
                 current = torch.cat([pred, next_time], dim=-1)
-    print(f"  ✓ {group} Day 10 預測完成")
+    print(f"  [完成] {group} Day 10 預測")
     del model
     torch.cuda.empty_cache()
 
