@@ -2,6 +2,7 @@
 slurm-*.out
 
 outputs/
+outputs96/
 data/
 wandb/
 __pycache__/
