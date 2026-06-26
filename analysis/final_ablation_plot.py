@@ -28,7 +28,7 @@ if os.path.exists(font_path):
 plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei']
 plt.rcParams['axes.unicode_minus'] = False
 
-OUTPUTS_DIR = 'outputs'
+OUTPUTS_DIR = os.environ.get('OUTPUT_ROOT', 'outputs')
 COMPARE_DIR = os.path.join(OUTPUTS_DIR, '_comparison')
 os.makedirs(COMPARE_DIR, exist_ok=True)
 
