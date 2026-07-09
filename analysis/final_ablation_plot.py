@@ -208,7 +208,7 @@ ax.set_xticks(x_pos)
 ax.set_xticklabels(groups, rotation=30, ha='right', fontsize=10)
 ax.set_ylabel('Best Test MSE (mean ± std)', fontsize=12, fontweight='bold')
 ax.set_xlabel('Architecture (sorted by performance)', fontsize=12)
-ax.set_title('All Architectures Ranked — Best Test MSE\n(Pure 2D < FNO Hybrid < Pure Spherical)',
+ax.set_title('All Architectures Ranked — Best Test MSE\n(FNO Hybrid < Pure 2D < Pure Spherical)',
              fontsize=14, fontweight='bold')
 
 legend_elements = [Patch(facecolor=CAT_COLOR[c], edgecolor='black',
