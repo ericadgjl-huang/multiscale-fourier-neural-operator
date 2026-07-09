@@ -54,11 +54,13 @@
 > - **epoch / total train time**：training_log.csv 累計，反映**訓練硬體 = 多台 RTX 4000 Ada**。
 > - **推論延遲 / 峰值記憶體**：`resource_comparison.py` 分析時**於單台 RTX 5070 桌機量測**（一次執行、全架構同機，故絕對值為裝置相依、**相對排序有效**）。
 > - **bestMSE 欄已改用 n=3 平均**（來自 `multi_seed_summary.csv`），故排序略有變動。
-> - 平面對照 **2d_ufno**（FFT+UNet，bestMSE 0.3951、4.29M）尚未納入本表（`resource_comparison.py` 未重跑）。
+> - 平面對照 **2d_ufno**（FFT+UNet，planar）已補進本表（params 4.29M、epoch 5.50 min @4000 Ada、bestMSE 0.3951 n=3）；
+>   其**推論延遲 / 峰值記憶體標「—」未量測** —— 5070 桌機現有 torch(cu126) 不支援其 sm_120 算力、無法 GPU 量測；其餘 11 架構沿用先前於桌機 GPU 的量測值。
 
 ```
 架構           幾何       參數   epoch(min) 推論(ms) bestMSE(n=3)
 sunetpp_fno   hybrid    3.04M   8.77      5.33    0.3915  🏆最準
+2d_ufno       planar    4.29M   5.50      —       0.3951  (推論/記憶體未量測)
 sufno         hybrid    2.20M   7.17      4.12    0.3980
 unetpp_2d     planar    2.27M   4.36      2.17    0.4017
 2d_fno        planar    4.22M   4.00      2.04    0.4029
