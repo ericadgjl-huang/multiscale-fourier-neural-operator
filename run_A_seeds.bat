@@ -1,22 +1,24 @@
 @echo off
 REM ================================================================
-REM  run_A_seeds.bat  —  96 變數 multi-seed + 平面 FNO 對照 (機器 A)
+REM  run_A_seeds.bat  --  96-var multi-seed + planar-FNO control (Machine A)
 REM
-REM  教授要求：
-REM   (1) 96 變數補跑 seeds，取得統計顯著性（seed 0 已在 outputs96/，本批補 seed 1/2 -> n=3）
-REM   (2) 新增「平面 FNO+UNet」對照組 2d_ufno（FFT+UNet，sufno 的平面孿生），
-REM       用來檢驗「spherical 不是必須」——若 2d_ufno ~= sufno，代表增益來自 FNO+UNet 而非球面。
+REM  (1) 96-var: fill in seeds for significance (seed 0 already in outputs96/,
+REM      this batch adds seed 1/2 -> n=3).
+REM  (2) New planar "FNO+UNet" control 2d_ufno (FFT+UNet, planar twin of sufno)
+REM      to test whether spherical is necessary: if 2d_ufno ~= sufno the gain
+REM      comes from FNO+UNet, not the sphere.
 REM
-REM  純球面 (sphere_*) 不補 seed：其 ~20% 劣勢已是鐵結論、且最慢（每 epoch 高達 14 分）。
-REM  已完成的資料夾會自動略過，可安全中斷後重跑（resume-friendly）。
-REM  預估本機總時長 ~32 小時（RTX 4000 Ada，batch=4）。
+REM  Pure spherical (sphere_*) is NOT reseeded: its ~20% deficit is already
+REM  a firm conclusion and it is the slowest (up to ~14 min/epoch).
+REM  Finished folders are auto-skipped, so it is safe to stop and rerun
+REM  (resume-friendly). Estimated total ~32 h (RTX 4000 Ada, batch=4).
 REM ================================================================
 setlocal
 set KMP_DUPLICATE_LIB_OK=TRUE
 set DG=data/global_era5_96_factors_*.nc
 set OUT=outputs96
 
-REM ---- 本機工作清單（由重到輕）----
+REM ---- work list for this machine (heaviest first) ----
 call :run sutrans_fno 1
 call :run sufno 1
 call :run transunet_2d 2
@@ -26,12 +28,12 @@ call :run unet_2d 1
 
 echo.
 echo ============================================
-echo  [機器 A] 全部工作結束。
+echo  [Machine A] all jobs finished.
 echo ============================================
 pause
 exit /b 0
 
-REM ---- 子程序：call :run ARCH SEED ----
+REM ---- subroutine: call :run ARCH SEED ----
 :run
 set ARCH=%1
 set SEED=%2
