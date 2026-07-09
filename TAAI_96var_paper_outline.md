@@ -49,9 +49,12 @@
 
 ### 1.3 資源效率（96 變數）
 
-> 參數 / epoch / 推論來自 `resource_summary.csv`（seed 0 量測，與 seed 無關，本次未重跑）；
-> **bestMSE 欄已改用 n=3 平均**（來自 `multi_seed_summary.csv`），故排序略有變動。
-> 平面對照 **2d_ufno**（FFT+UNet，bestMSE 0.3951、4.29M）尚未納入本表（`resource_summary.csv` 需 GPU 重跑才會出現）。
+> 各欄來源（硬體須誠實標註）：
+> - **參數**：config.json 直接讀，與硬體無關。
+> - **epoch / total train time**：training_log.csv 累計，反映**訓練硬體 = 多台 RTX 4000 Ada**。
+> - **推論延遲 / 峰值記憶體**：`resource_comparison.py` 分析時**於單台 RTX 5070 桌機量測**（一次執行、全架構同機，故絕對值為裝置相依、**相對排序有效**）。
+> - **bestMSE 欄已改用 n=3 平均**（來自 `multi_seed_summary.csv`），故排序略有變動。
+> - 平面對照 **2d_ufno**（FFT+UNet，bestMSE 0.3951、4.29M）尚未納入本表（`resource_comparison.py` 未重跑）。
 
 ```
 架構           幾何       參數   epoch(min) 推論(ms) bestMSE(n=3)
@@ -111,7 +114,8 @@ sphere_transunet spherical 3.34M 14.49    8.87    0.5269  墊底
 
 ### 4. Experimental Setup
 - 4.1 資料：96 變數 ERA5，2021–23、6h 一筆；train 2021–22 / test 2023；標準化僅用訓練集統計量。
-- 4.2 硬體：**多台 NVIDIA RTX 4000 Ada 分散訓練**（呼應本次多機流程）。
+- 4.2 硬體：訓練用**多台 NVIDIA RTX 4000 Ada 分散訓練**（呼應本次多機流程）；
+  §1.3 的**推論延遲與峰值記憶體則於單台 RTX 5070 桌機量測**（全架構同機一次跑完，供相對比較；絕對值為裝置相依，論文表格須註明此點）。
 - 4.3 超參數：base width 32；FNO modes 16；sphere modes (8,4,2)；Transformer bottleneck 4 層 / 4 head / FFN×4。
 
 ### 5. Results
