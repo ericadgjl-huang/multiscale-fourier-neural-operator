@@ -51,25 +51,26 @@
 
 > 各欄來源（硬體須誠實標註）：
 > - **參數**：config.json 直接讀，與硬體無關。
-> - **epoch(min)**：training_log.csv 的 seed 0 每-epoch 時間，反映**訓練硬體（主體為 RTX 4000 Ada）**。
-> - **推論延遲 / 峰值記憶體**：`resource_comparison.py` **於單台 RTX 5070 桌機量測**（conda 環境 `unet_cuda` / torch 2.10+cu128；**全 12 架構同一次執行**，故絕對值裝置相依、**相對排序有效**）。
-> - **bestMSE 欄用 n=3 平均**（來自 `multi_seed_summary.csv`），排序即按 n=3 結果。
-> - 平面對照 **2d_ufno**（FFT+UNet，planar）已完整納入：推論 **3.18 ms**（比最佳 hybrid sunetpp_fno 的 5.80 ms 快近一倍、僅略慢於純卷積 UNet），peak mem 37.4 MB。→ 佐證「平面 FFT+UNet 兼具準度與效率，球面非必須」。
+> - **epoch(min)**：training_log.csv 每-epoch 時間、**跨 n 個 seed 取平均**，反映**訓練硬體（主體為 RTX 4000 Ada）**。
+> - **推論延遲 / 峰值記憶體**：`resource_comparison.py` **於單台 RTX 5070 桌機量測**（conda 環境 `unet_cuda` / torch 2.10+cu128；**全 12 架構同一次執行、每架構量一次**，故絕對值裝置相依、**相對排序有效**）。
+> - **bestMSE = n 個 seed 平均**（與 `multi_seed_summary.csv` 一致），排序即按 n=3 結果。
+> - 腳本已改為**按架構聚合**（每架構一列、非每 seed 一列）→ `resource_summary.csv` / `resource_comparison.png` 現為乾淨 12 列 / 12 長條，可直接放論文。
+> - 平面對照 **2d_ufno**（FFT+UNet，planar）已完整納入：推論 **3.13 ms**（比最佳 hybrid sunetpp_fno 的 5.74 ms 快近一倍、僅略慢於純卷積 UNet），peak mem 37.4 MB。→ 佐證「平面 FFT+UNet 兼具準度與效率、球面非必須」。
 
 ```
-架構           幾何       參數   epoch(min) 推論(ms) peakMem(MB) bestMSE(n=3)
-sunetpp_fno   hybrid    3.04M   8.77      5.80    40.2       0.3915  🏆最準
-2d_ufno       planar    4.29M   5.50      3.18    37.4       0.3951
-sufno         hybrid    2.20M   7.17      4.00    30.2       0.3980
-unetpp_2d     planar    2.27M   4.36      2.27    47.0       0.4017
-2d_fno        planar    4.22M   4.00      2.43    37.1       0.4029
-unet_2d       planar    2.37M   3.64      1.89    38.1       0.4037  ⚡最快
-sfno          spherical 2.12M   5.52      3.43    30.0       0.4043
-transunet_2d  planar    1.42M   5.98      3.26    34.9       0.4305  (±0.0256 高變異)
-sutrans_fno   hybrid    2.28M  12.78      6.94    30.6       0.4358
-sphere_unet   spherical 2.52M  11.61      7.50    37.6       0.4767
-sphere_unetpp spherical 2.65M  13.56      8.75    45.1       0.4780
-sphere_transunet spherical 3.34M 14.49    8.55    40.4       0.5269  墊底
+架構           幾何       n  參數   epoch(min) 推論(ms) peakMem(MB) bestMSE
+sunetpp_fno   hybrid    3  3.04M   9.02      5.74    40.2       0.3915  🏆最準
+2d_ufno       planar    3  4.29M   5.39      3.13    37.4       0.3951
+sufno         hybrid    3  2.20M   6.94      4.17    30.2       0.3980
+unetpp_2d     planar    3  2.27M   4.44      2.19    47.0       0.4017
+2d_fno        planar    3  4.22M   4.25      1.96    37.7       0.4029
+unet_2d       planar    3  2.37M   3.61      1.79    37.3       0.4037  ⚡最快
+sfno          spherical 3  2.12M   5.57      3.74    29.8       0.4043
+transunet_2d  planar    3  1.42M   6.18      3.04    34.9       0.4305  (±0.0256 高變異)
+sutrans_fno   hybrid    3  2.28M  12.51      6.25    30.6       0.4358
+sphere_unet   spherical 1  2.52M  11.61      7.65    37.6       0.4767
+sphere_unetpp spherical 1  2.65M  13.56      9.02    45.1       0.4780
+sphere_transunet spherical 1 3.34M 14.49     8.66    40.8       0.5269  墊底
 ```
 
 三方權衡：**平面 = 效率最佳（且 2d_ufno 準度直逼最佳 hybrid）；FNO 混合 = 準度最佳；純球面 = 又慢又差被全面輾壓。**

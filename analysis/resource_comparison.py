@@ -8,7 +8,9 @@ resource_comparison.py（96 變數 / 11 架構版）
 - Peak GPU memory + Inference latency：用 models.build_model 以正確的 96 變數輸入通道數
   建模、載入 model_weights_best.pt，做 forward 量測
 
-涵蓋 OUTPUT_ROOT 下「全部」出現的架構（11 個），而非寫死 5 個。
+涵蓋 OUTPUT_ROOT 下「全部」出現的架構，而非寫死 5 個。
+多 seed：同一架構的多個 seed 會**聚合成一列**（epoch / total time / bestMSE 取 n 個 seed 平均、
+inference 與 peak mem 每架構只量一次），故輸出為「每架構一列」而非每 seed 一列。
 依名稱分類 geometry 上色：
 - planar       ：名稱以 _2d 結尾或 2d_ 開頭（unet_2d / unetpp_2d / transunet_2d / 2d_fno）
 - fno_hybrid   ：sufno / sunetpp_fno / sutrans_fno
@@ -146,8 +148,33 @@ for d in sorted(glob.glob(os.path.join(OUTPUTS_DIR, '*'))):
 if not records:
     raise RuntimeError(f"在 {OUTPUTS_DIR}/ 下找不到任何完成實驗（需 config.json + training_log.csv）")
 
-df_all = pd.DataFrame(records)
-print(f"找到 {len(df_all)} 個實驗：{', '.join(df_all['group'])}")
+df_raw = pd.DataFrame(records)
+
+# ---- 按 base architecture（group）聚合成「每架構一列」，避免多 seed 灌成 N 列 ----
+#   params / num_channels / nlat / nlon / cfg / dir：同架構各 seed 相同 → 取第一個
+#   avg_epoch_sec / total_train_sec / best_test_mse：跨 seed 取平均（n 個 seed 的統計代表值）
+#   inference / peak mem 稍後只對每架構量一次（見第 2 節）
+agg_rows = []
+for group, g in df_raw.groupby('group', sort=False):
+    first = g.iloc[0]
+    agg_rows.append({
+        'arch':            group,
+        'group':           group,
+        'dir':             first['dir'],
+        'cfg':             first['cfg'],
+        'param_count':     first['param_count'],
+        'num_channels':    first['num_channels'],
+        'nlat':            first['nlat'],
+        'nlon':            first['nlon'],
+        'avg_epoch_sec':   g['avg_epoch_sec'].mean(),
+        'total_train_sec': g['total_train_sec'].mean(),
+        'epochs':          int(first['epochs']),
+        'best_test_mse':   g['best_test_mse'].mean(),
+        'n_seeds':         len(g),
+    })
+df_all = pd.DataFrame(agg_rows)
+print(f"找到 {len(df_raw)} 個 run，聚合成 {len(df_all)} 個架構："
+      f"{', '.join(f'{r.group}(n={r.n_seeds})' for r in df_all.itertuples())}")
 
 ################################################################
 # 2. 對每個模型量測 inference latency + peak GPU memory
@@ -232,7 +259,7 @@ out_df['avg_epoch_min']  = out_df['avg_epoch_sec'] / 60
 out_df['total_train_hr'] = out_df['total_train_sec'] / 3600
 out_df['category']       = out_df['group'].map(categorize)
 
-export_cols = ['group', 'category', 'param_count_M', 'avg_epoch_min', 'total_train_hr',
+export_cols = ['group', 'category', 'n_seeds', 'param_count_M', 'avg_epoch_min', 'total_train_hr',
                'inference_ms_per_step', 'peak_gpu_mem_MB', 'best_test_mse']
 export_df = out_df[export_cols].copy()
 for col, nd in [('param_count_M', 2), ('avg_epoch_min', 2), ('total_train_hr', 2),
