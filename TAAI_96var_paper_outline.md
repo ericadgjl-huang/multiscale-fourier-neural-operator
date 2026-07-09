@@ -51,26 +51,25 @@
 
 > 各欄來源（硬體須誠實標註）：
 > - **參數**：config.json 直接讀，與硬體無關。
-> - **epoch / total train time**：training_log.csv 累計，反映**訓練硬體 = 多台 RTX 4000 Ada**。
-> - **推論延遲 / 峰值記憶體**：`resource_comparison.py` 分析時**於單台 RTX 5070 桌機量測**（一次執行、全架構同機，故絕對值為裝置相依、**相對排序有效**）。
-> - **bestMSE 欄已改用 n=3 平均**（來自 `multi_seed_summary.csv`），故排序略有變動。
-> - 平面對照 **2d_ufno**（FFT+UNet，planar）已補進本表（params 4.29M、epoch 5.50 min @4000 Ada、bestMSE 0.3951 n=3）；
->   其**推論延遲 / 峰值記憶體標「—」未量測** —— 5070 桌機現有 torch(cu126) 不支援其 sm_120 算力、無法 GPU 量測；其餘 11 架構沿用先前於桌機 GPU 的量測值。
+> - **epoch(min)**：training_log.csv 的 seed 0 每-epoch 時間，反映**訓練硬體（主體為 RTX 4000 Ada）**。
+> - **推論延遲 / 峰值記憶體**：`resource_comparison.py` **於單台 RTX 5070 桌機量測**（conda 環境 `unet_cuda` / torch 2.10+cu128；**全 12 架構同一次執行**，故絕對值裝置相依、**相對排序有效**）。
+> - **bestMSE 欄用 n=3 平均**（來自 `multi_seed_summary.csv`），排序即按 n=3 結果。
+> - 平面對照 **2d_ufno**（FFT+UNet，planar）已完整納入：推論 **3.18 ms**（比最佳 hybrid sunetpp_fno 的 5.80 ms 快近一倍、僅略慢於純卷積 UNet），peak mem 37.4 MB。→ 佐證「平面 FFT+UNet 兼具準度與效率，球面非必須」。
 
 ```
-架構           幾何       參數   epoch(min) 推論(ms) bestMSE(n=3)
-sunetpp_fno   hybrid    3.04M   8.77      5.33    0.3915  🏆最準
-2d_ufno       planar    4.29M   5.50      —       0.3951  (推論/記憶體未量測)
-sufno         hybrid    2.20M   7.17      4.12    0.3980
-unetpp_2d     planar    2.27M   4.36      2.17    0.4017
-2d_fno        planar    4.22M   4.00      2.04    0.4029
-unet_2d       planar    2.37M   3.64      1.76    0.4037  ⚡最快
-sfno          spherical 2.12M   5.52      3.45    0.4043
-transunet_2d  planar    1.42M   5.98      2.61    0.4305  (±0.0256 高變異)
-sutrans_fno   hybrid    2.28M  12.78      6.33    0.4358
-sphere_unet   spherical 2.52M  11.61      7.56    0.4767
-sphere_unetpp spherical 2.65M  13.56      8.89    0.4780
-sphere_transunet spherical 3.34M 14.49    8.87    0.5269  墊底
+架構           幾何       參數   epoch(min) 推論(ms) peakMem(MB) bestMSE(n=3)
+sunetpp_fno   hybrid    3.04M   8.77      5.80    40.2       0.3915  🏆最準
+2d_ufno       planar    4.29M   5.50      3.18    37.4       0.3951
+sufno         hybrid    2.20M   7.17      4.00    30.2       0.3980
+unetpp_2d     planar    2.27M   4.36      2.27    47.0       0.4017
+2d_fno        planar    4.22M   4.00      2.43    37.1       0.4029
+unet_2d       planar    2.37M   3.64      1.89    38.1       0.4037  ⚡最快
+sfno          spherical 2.12M   5.52      3.43    30.0       0.4043
+transunet_2d  planar    1.42M   5.98      3.26    34.9       0.4305  (±0.0256 高變異)
+sutrans_fno   hybrid    2.28M  12.78      6.94    30.6       0.4358
+sphere_unet   spherical 2.52M  11.61      7.50    37.6       0.4767
+sphere_unetpp spherical 2.65M  13.56      8.75    45.1       0.4780
+sphere_transunet spherical 3.34M 14.49    8.55    40.4       0.5269  墊底
 ```
 
 三方權衡：**平面 = 效率最佳（且 2d_ufno 準度直逼最佳 hybrid）；FNO 混合 = 準度最佳；純球面 = 又慢又差被全面輾壓。**
@@ -117,7 +116,7 @@ sphere_transunet spherical 3.34M 14.49    8.87    0.5269  墊底
 ### 4. Experimental Setup
 - 4.1 資料：96 變數 ERA5，2021–23、6h 一筆；train 2021–22 / test 2023；標準化僅用訓練集統計量。
 - 4.2 硬體：訓練用**多台 NVIDIA RTX 4000 Ada 分散訓練**（呼應本次多機流程）；
-  §1.3 的**推論延遲與峰值記憶體則於單台 RTX 5070 桌機量測**（全架構同機一次跑完，供相對比較；絕對值為裝置相依，論文表格須註明此點）。
+  §1.3 的**推論延遲與峰值記憶體於單台 RTX 5070 桌機量測**（torch 2.10+cu128；全 12 架構同一次執行，供相對比較；絕對值裝置相依，論文表格須註明此點）。
 - 4.3 超參數：base width 32；FNO modes 16；sphere modes (8,4,2)；Transformer bottleneck 4 層 / 4 head / FFN×4。
 
 ### 5. Results
